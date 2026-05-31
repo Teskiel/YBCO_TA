@@ -1,0 +1,21 @@
+﻿# 大型数据文件
+*.csv
+*.log
+*.dat
+*.hdf5
+*.h5
+*.mat
+*.npz
+*.pkl
+*.raw
+data/
+
+# Python 临时文件
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 系统文件
+Thumbs.db
+.DS_Store
