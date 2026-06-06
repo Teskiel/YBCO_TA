@@ -106,7 +106,7 @@ temp_reader = LakeShore335(visa_address= "ASRL4::INSTR")
 laser = KeysightLaser(laser_resource)
 
 # 基础目录设定
-date = "20260526"
+date = "20260529"
 base_folder = rf'D:\YBCO\VNAMeas\data\{date}\-45dBm'
 
 # 你需要扫描的功率列表 (单位: mW)
@@ -145,7 +145,7 @@ for power in power_levels:
 
     # 4. 自动生成类似 '4K-5mW-laser' 这样的文件夹
     # 取整数温度值构建文件夹名，如果你确定一直维持在4K附近，可将int(current_temp)替换为'4K'
-    folder_data = os.path.join(base_folder, f'4K-{power}mW-laser')
+    folder_data = os.path.join(base_folder, f'50K-{power}mW-laser')
     
     if not os.path.exists(folder_data):
         os.makedirs(folder_data)

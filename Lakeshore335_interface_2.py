@@ -59,7 +59,16 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
-    QGroupBox,
+    QGroupBox,K] Laser power → 1 mW
+[OK] Laser power → 3 mW
+[OK] Laser power → 5 mW
+[OK] Laser power → 7 mW
+[OK] Laser power → 9 mW
+[OK] Laser power → 1 mW
+[OK] Laser power → 3 mW
+[OK] Laser power → 5 mW
+[OK] Laser power → 7 mW
+
     QHBoxLayout,
     QLabel,
     QLineEdit,

@@ -1,0 +1,57 @@
+{
+  "addresses": {
+    "laser": "TCPIP0::K-N7779C-00108::inst0::INSTR",
+    "lakeshore": "GPIB0::12::INSTR",
+    "vna": "TCPIP0::localhost::hislip_PXI10_CHASSIS1_SLOT1_INDEX0::INSTR"
+  },
+  "laser": {
+    "wavelength_nm": 1550.0,
+    "power_sequence_mw": [
+      0,
+      1,
+      3,
+      5,
+      7,
+      9
+    ]
+  },
+  "lakeshore": {
+    "loop1": {
+      "setpoint_k": 26.0,
+      "pid": {
+        "p": 100.0,
+        "i": 5.0,
+        "d": 0.0
+      },
+      "heater_range": 2
+    },
+    "loop2": {
+      "setpoint_k": 0.0,
+      "pid": {
+        "p": 0.0,
+        "i": 0.0,
+        "d": 0.0
+      },
+      "heater_range": 0
+    }
+  },
+  "vna": {
+    "start_freq_hz": 3000000000.0,
+    "stop_freq_hz": 6000000000.0,
+    "s_parameter": "S21",
+    "power_dbm": [
+      -45,
+      -35,
+      -25
+    ],
+    "points": 50001,
+    "if_bandwidth_hz": 10000
+  },
+  "temperature_sweep": {
+    "mode": "range",
+    "fixed_temps": [],
+    "range_start": 6,
+    "range_stop": 90,
+    "range_step": 2
+  }
+}

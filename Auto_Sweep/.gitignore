@@ -1,0 +1,25 @@
+# 实验数据（大型 .s2p 文件，不纳入版本控制）
+experiment_data/
+
+# 压缩包
+*.zip
+*.rar
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 临时文件
+*.tmp.*
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+
+# 图片输出
+plot_dashboard/pic/
+
+# 系统文件
+Thumbs.db

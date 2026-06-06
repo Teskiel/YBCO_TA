@@ -17,7 +17,7 @@ from Lakeshore335 import LakeShore335
 # 1. 仪器资源配置区
 # ---------------------------
 # 新 Keysight VNA HiSLIP 本地资源地址
-resource_vna = 'TCPIP0::127.0.0.1::hislip_PXI10_CHASSIS1_SLOT1_INDEX0::INSTR'
+resource_vna = 'TCPIP0::DESKTOP-1PLPGMT::hislip_PXI10_CHASSIS2_SLOT1_INDEX0::INSTR'
 # 激光器 IP 地址
 laser_resource = 'TCPIP0::100.65.11.65::INSTR' 
 # 温度计串口地址
@@ -33,6 +33,8 @@ os.makedirs(base_folder, exist_ok=True)
 
 # 扫描的功率列表 (单位: mW)
 power_levels = [0, 1, 3, 5, 7, 9, 11, 13, 15, 17]
+
+# power_levels = [7,9, 11, 13]
 
 # ---------------------------
 # 2. 激光器控制模块
@@ -119,7 +121,7 @@ try:
 
         # 等待 3 分钟让温度/状态稳定
         print("等待 3 分钟让系统状态稳定...")
-        for remaining in range(60, 0, -10):
+        for remaining in range(10, 0, -10):
             print(f"剩余等待时间: {remaining} 秒", end='\r')
             sleep(10)
         print("\n稳定时间到，正在抓取此时此刻的温度...")
@@ -132,7 +134,7 @@ try:
             current_temp = 4.0
 
         # 🎯 【核心修改 2】：算法自动寻找最接近的理论目标温度点 (4, 10, 20, 40, 77)
-        theoretical_targets = [4,10,20,30,40,50,60,77]
+        theoretical_targets = [4,5,10,20,30,40,50,60,70,77]
         closest_target = min(theoretical_targets, key=lambda x: abs(x - current_temp))
         
         print(f"【实时状态】实际温度: {current_temp:.3f} K | 自动归类至理论温点: {closest_target}K")

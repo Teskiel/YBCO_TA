@@ -135,7 +135,19 @@ class LakeShore335:
         :return: Current temperature in Kelvin.
         """
         response = self.device.query(f"KRDG? {channel}\r")
-        return float(response)
+        
+        try:
+            temp = float(response)
+            
+        except:
+            
+            time.sleep(5)
+            
+            response = self.device.query(f"KRDG? {channel}\r")
+            
+            temp = float(response)
+            
+        return temp
 
     def set_heater_range(self, channel, range_level):
         """
