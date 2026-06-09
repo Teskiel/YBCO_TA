@@ -2,13 +2,19 @@
 *.csv
 *.log
 *.dat
+*.txt
 *.hdf5
 *.h5
 *.mat
 *.npz
 *.pkl
 *.raw
+*.s2p
 data/
+
+# 压缩包
+*.rar
+*.zip
 
 # Python 临时文件
 __pycache__/

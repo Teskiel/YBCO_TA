@@ -26,7 +26,7 @@ resource_lakeshore = 'ASRL4::INSTR'  # 确认对应电脑的 COM4 接口
 # 💡 核心串口参数对齐（依据 NI MAX 截图 9600 设定，若连不上可在面板修改此处为 57600）
 LS_BAUD_RATE = 57600 
 
-date_str = "20260527"
+date_str = "20260609"
 base_dir = rf'D:\YBCO\VNAMeas\data\{date_str}\-45dBm'
 os.makedirs(base_dir, exist_ok=True)
 

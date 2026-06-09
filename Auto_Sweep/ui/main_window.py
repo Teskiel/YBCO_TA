@@ -133,6 +133,8 @@ class MainWindow(QMainWindow):
                 "stop_freq_hz": vna["stop_freq_hz"],
                 "s_parameter": vna["s_parameter"],
                 "power_dbm": vna["power_dbm"],
+                "power_dbm_button": vna.get("power_dbm_button", vna["power_dbm"]),
+                "power_range_settings": vna.get("power_range_settings", {}),
                 "points": vna["points"],
                 "if_bandwidth_hz": vna["if_bandwidth_hz"],
             },

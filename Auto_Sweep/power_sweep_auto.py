@@ -17,7 +17,6 @@ Architecture:
     config.py               → all constants
     stability_monitor.py    → AdvancedStabilityMonitor
     pid_controller.py       → SmartPIDController
-    temperature_diagnostics.py → TemperatureDiagnostics
     lakeshore_control.py    → LakeShore335 + duck-typing helpers
     vna_control.py          → save_s2p, try_connect
     laser_driver.py         → LaserController
@@ -35,20 +34,12 @@ from config import (
     date, base_folder,
     power_levels_mw, temperature_levels_k,
     temperature_poll_seconds, max_wait_seconds, stable_hold_seconds,
-    stability_method, custom_stability_settings, setpoint_adjust_settings,
-    enable_diagnostics, diagnostic_interval,
+    custom_stability_settings, setpoint_adjust_settings,
 )
 
 # ---- algorithms ----
 from stability_monitor import AdvancedStabilityMonitor
 from pid_controller import SmartPIDController
-
-# ---- diagnostics (optional import preserved for graceful degradation) ----
-try:
-    from temperature_diagnostics import TemperatureDiagnostics
-except ImportError as e:
-    print(f"[Warning] temperature_diagnostics not found, diagnostics disabled: {e}")
-    TemperatureDiagnostics = None
 
 # ---- instruments ----
 from lakeshore_control import (
@@ -100,15 +91,8 @@ def wait_for_temperature(temp_reader, target_k: float,
     if stability_monitor is None:
         stability_monitor = AdvancedStabilityMonitor()
 
-    diagnostics = (
-        TemperatureDiagnostics()
-        if (enable_diagnostics and TemperatureDiagnostics is not None)
-        else None
-    )
-
     start_time = time()
     last_stable_time = None
-    last_diagnostic_time = 0
     setpoint_adjusted = False
     current_setpoint = target_k
 
@@ -142,18 +126,9 @@ def wait_for_temperature(temp_reader, target_k: float,
         elapsed = time() - start_time
         error_k = abs(current_k - target_k)
 
-        # periodic diagnostics
-        if diagnostics and elapsed - last_diagnostic_time >= diagnostic_interval:
-            last_diagnostic_time = elapsed
-            temps = [r.temperature for r in stability_monitor.readings[-60:]]
-            if temps:
-                diag_result = diagnostics.analyze(temps, target_temp=target_k)
-                print(f"\n[Diagnostic @ {elapsed / 60:.1f} min] "
-                      f"{diag_result.description}")
-
         # stability check
         stability_result = stability_monitor.check_stability(
-            target_k, method=stability_method)
+            target_k, method="custom")
 
         print(
             f"Target {target_k:.3f}K | SP {current_setpoint:.3f}K | "
@@ -225,7 +200,7 @@ def main():
     print(f"Temperature range: {min(temperature_levels_k)} – "
           f"{max(temperature_levels_k)} K")
     print(f"Power levels: {power_levels_mw} mW")
-    print(f"Stability method: {stability_method}")
+    print(f"Stability method: custom")
     print(f"Custom criteria:")
     print(f"  • 1-min average within "
           f"±{custom_stability_settings['avg_tolerance_k']}K")

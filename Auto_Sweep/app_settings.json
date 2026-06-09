@@ -17,13 +17,13 @@
   },
   "lakeshore": {
     "loop1": {
-      "setpoint_k": 26.0,
+      "setpoint_k": 4.0,
       "pid": {
         "p": 100.0,
         "i": 5.0,
         "d": 0.0
       },
-      "heater_range": 2
+      "heater_range": 0
     },
     "loop2": {
       "setpoint_k": 0.0,
@@ -40,16 +40,27 @@
     "stop_freq_hz": 6000000000.0,
     "s_parameter": "S21",
     "power_dbm": [
-      -45,
-      -35,
-      -25
+      -40,
+      -30
     ],
+    "power_dbm_button": [
+      -40,
+      -30
+    ],
+    "power_range_settings": {
+      "enabled": false,
+      "start_dbm": -55,
+      "stop_dbm": -45,
+      "step_db": 2
+    },
     "points": 50001,
     "if_bandwidth_hz": 10000
   },
   "temperature_sweep": {
-    "mode": "range",
-    "fixed_temps": [],
+    "mode": "fixed",
+    "fixed_temps": [
+      26.0
+    ],
     "range_start": 6,
     "range_stop": 90,
     "range_step": 2

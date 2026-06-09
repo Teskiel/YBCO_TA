@@ -40,20 +40,25 @@ temperature_levels_k = list(range(26, 101, 2))
 # Temperature stability parameters
 # =========================================================================
 
-temperature_tolerance_k = 0.50       # only used by check_stability_simple
 stable_hold_seconds = 60             # must stay stable this long before measuring
 max_wait_seconds = 30 * 60           # 30-minute timeout per temperature point
 temperature_poll_seconds = 10        # polling interval (~6 readings/min)
 
-stability_method = "custom"          # "simple" | "v1" | "v2" | "v3" | "custom"
-
 custom_stability_settings = {
     "avg_window_seconds": 60,        # 1-minute rolling window
     "avg_tolerance_k": 1.0,          # average within ±1.0 K of setpoint
-    "delta_tolerance_k": 0.5,        # max drift between consecutive windows
-    "final_stable_band_k": 0.5,      # 放宽标准：±0.5 K（原 0.2K）
-    "min_readings_required": 10,     # 匹配 180s 回溯窗口 + 10s 轮询（最多 18 个读数）
+    "delta_tolerance_k": 0.2,        # max drift over 2-minute span — 趋于平稳阈值
+    "final_stable_band_k": 0.5,      # ±0.5 K 进入目标温度区间
+    "min_readings_required": 10,     # 匹配 180s 回溯窗口
 }
+
+# ---- 稳态判定（与目标区间判定并行，无先后关系） ----
+steady_state_max_min_k = 0.1         # 3 分钟窗口 max-min ≤ 0.1K = 进入稳态
+steady_state_window_s = 180          # 稳态判定窗口（3 分钟）
+
+# ---- 双阶段轮询间隔 ----
+sparse_poll_seconds = 30             # Phase 1 低频读取（趋于平稳前）
+fine_poll_seconds = 5                # Phase 2 高频读取（趋于平稳后，密集判稳态）
 
 # =========================================================================
 # Setpoint adjustment (overshoot / undershoot compensation)
@@ -102,8 +107,15 @@ stability_fallback_settings = {
 }
 
 # =========================================================================
-# Diagnostics
+# 测量逻辑版本
 # =========================================================================
 
-enable_diagnostics = True
-diagnostic_interval = 30            # seconds between diagnostic checks
+MEASUREMENT_LOGIC_VERSION = "2026-06-08"  # 每次修改测量流程后更新，写入数据头部
+
+# =========================================================================
+# VNA 功率区间扫描默认值（与按钮网格并行使用）
+# =========================================================================
+
+vna_power_range_default_start_dbm = -55  # 功率区间起始 dBm
+vna_power_range_default_stop_dbm = -45   # 功率区间终止 dBm
+vna_power_range_default_step_db = 2      # 功率区间步长 dB

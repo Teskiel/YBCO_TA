@@ -7,6 +7,9 @@ Naming convention: test_given_<precondition>_when_<action>_then_<expected>
 
 import sys
 import os
+
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -43,7 +46,6 @@ class TestSweepSettings:
 
     def test_given_stability_settings_when_checking_then_all_tolerances_positive(self):
         import config
-        assert config.temperature_tolerance_k > 0
         assert config.stable_hold_seconds > 0
         assert config.max_wait_seconds > config.stable_hold_seconds
         assert config.temperature_poll_seconds > 0
@@ -55,7 +57,6 @@ class TestCustomStabilitySettings:
     def test_given_custom_settings_when_checking_then_final_band_tighter_than_avg_tolerance(self):
         import config
         s = config.custom_stability_settings
-        # 放宽后的 final_stable_band_k = 0.5K，仍应 ≤ avg_tolerance (1.0K)
         assert s['final_stable_band_k'] <= s['avg_tolerance_k']
 
     def test_given_custom_settings_when_checking_then_delta_tolerance_stricter_than_avg(self):
@@ -129,14 +130,10 @@ class TestAutoReconnectConfig:
 
     def test_given_config_loaded_when_reconnect_settings_present_then_valid(self):
         import config
-        assert hasattr(config, "max_reconnect_attempts"), \
-            "max_reconnect_attempts 应该存在"
-        assert config.max_reconnect_attempts >= 1, \
-            "最大重连次数应 >= 1"
-        assert hasattr(config, "reconnect_delay_seconds"), \
-            "reconnect_delay_seconds 应该存在"
-        assert config.reconnect_delay_seconds >= 0, \
-            "重连延迟应 >= 0"
+        assert hasattr(config, "max_reconnect_attempts")
+        assert config.max_reconnect_attempts >= 1
+        assert hasattr(config, "reconnect_delay_seconds")
+        assert config.reconnect_delay_seconds >= 0
 
 
 class TestStabilityFallbackConfig:
@@ -144,63 +141,12 @@ class TestStabilityFallbackConfig:
 
     def test_given_config_loaded_when_fallback_settings_present_then_valid(self):
         import config
-        assert hasattr(config, "stability_fallback_settings"), \
-            "stability_fallback_settings 应该存在"
+        assert hasattr(config, "stability_fallback_settings")
         s = config.stability_fallback_settings
-        assert s["good_enough_band_k"] > 0, \
-            "good_enough_band_k 应 > 0"
-        assert s["max_setpoint_adjustments"] >= 1, \
-            "max_setpoint_adjustments 应 >= 1"
-        assert s["diagnostic_interval_s"] > 0, \
-            "diagnostic_interval_s 应 > 0"
-        assert s["max_overshoot_k"] > 0, \
-            "max_overshoot_k 应 > 0"
-
-    def test_given_fixed_pid_zones_when_checking_then_all_zones_valid(self):
-        """FIXED_PID_ZONES 应包含 low/medium/high 三个温区。"""
-        import config
-        zones = config.FIXED_PID_ZONES
-        for name in ("low", "medium", "high"):
-            assert name in zones
-            z = zones[name]
-            assert "p" in z and z["p"] > 0
-            assert "i" in z and z["i"] >= 0
-            assert "d" in z and z["d"] == 0
-            assert "base_overshoot_k" in z and z["base_overshoot_k"] >= 0
-            assert "max_temp" in z
-
-
-class TestAutoReconnectConfig:
-    """验证自动重连配置项的完整性。"""
-
-    def test_given_config_loaded_when_reconnect_settings_present_then_valid(self):
-        import config
-        assert hasattr(config, "max_reconnect_attempts"), \
-            "max_reconnect_attempts 应该存在"
-        assert config.max_reconnect_attempts >= 1, \
-            "最大重连次数应 >= 1"
-        assert hasattr(config, "reconnect_delay_seconds"), \
-            "reconnect_delay_seconds 应该存在"
-        assert config.reconnect_delay_seconds >= 0, \
-            "重连延迟应 >= 0"
-
-
-class TestStabilityFallbackConfig:
-    """验证稳定性回退配置项的完整性。"""
-
-    def test_given_config_loaded_when_fallback_settings_present_then_valid(self):
-        import config
-        assert hasattr(config, "stability_fallback_settings"), \
-            "stability_fallback_settings 应该存在"
-        s = config.stability_fallback_settings
-        assert s["good_enough_band_k"] > 0, \
-            "good_enough_band_k 应 > 0"
-        assert s["max_setpoint_adjustments"] >= 1, \
-            "max_setpoint_adjustments 应 >= 1"
-        assert s["diagnostic_interval_s"] > 0, \
-            "diagnostic_interval_s 应 > 0"
-        assert s["max_overshoot_k"] > 0, \
-            "max_overshoot_k 应 > 0"
+        assert s["good_enough_band_k"] > 0
+        assert s["max_setpoint_adjustments"] >= 1
+        assert s["diagnostic_interval_s"] > 0
+        assert s["max_overshoot_k"] > 0
 
     def test_given_fixed_pid_zones_when_checking_then_all_zones_valid(self):
         """FIXED_PID_ZONES 应包含 low/medium/high 三个温区。"""
@@ -228,9 +174,22 @@ class TestOutputPath:
         assert config.base_folder[1:3] == ':\\' or config.base_folder.startswith('/')
 
 
-class TestDiagnosticsSettings:
-    """Given diagnostics config, settings should be sensible."""
+# =========================================================================
+# 新增：测量逻辑版本号（需求4.2）
+# =========================================================================
 
-    def test_given_diagnostics_when_checking_then_interval_positive(self):
+class TestMeasurementVersion:
+    """验证 MEASUREMENT_LOGIC_VERSION 常量的存在性和格式。"""
+
+    def test_given_config_loaded_when_version_present_then_valid_format(self):
         import config
-        assert config.diagnostic_interval > 0
+        assert hasattr(config, "MEASUREMENT_LOGIC_VERSION")
+        version = config.MEASUREMENT_LOGIC_VERSION
+        import re
+        assert re.match(r"^\d{4}-\d{2}-\d{2}$", version)
+
+    def test_given_version_when_reading_then_is_string(self):
+        import config
+        assert isinstance(config.MEASUREMENT_LOGIC_VERSION, str)
+
+

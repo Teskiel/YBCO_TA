@@ -179,6 +179,140 @@ class VnaPowerGrid(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# VnaPowerRangeWidget — 功率区间扫描设置（并行于按钮网格）
+# ---------------------------------------------------------------------------
+
+class VnaPowerRangeWidget(QWidget):
+    """VNA source power range sweep — similar to TemperatureSweepWidget.
+
+    Generates a list of dBm values from start/stop/step, used in parallel
+    with the VnaPowerGrid toggle selection.  Both systems' values are
+    merged (union, sorted, deduplicated) before being sent to the VNA.
+
+    Default range: -55 to -45 dBm, step 2 dB (user's YBCO test config).
+    """
+
+    selection_changed = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        import config
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        # ---- enable checkbox ----
+        self._enabled_check = QPushButton("☑ Power Range Sweep")
+        self._enabled_check.setCheckable(True)
+        self._enabled_check.setChecked(True)
+        self._enabled_check.setStyleSheet("""
+            QPushButton {
+                text-align: left; font-weight: bold; color: #4ADE80;
+                background: transparent; border: none; padding: 4px 0;
+            }
+            QPushButton:checked {
+                color: #4ADE80;
+            }
+            QPushButton:!checked {
+                color: #8B949E;
+            }
+        """)
+        self._enabled_check.toggled.connect(self._on_changed)
+        root.addWidget(self._enabled_check)
+
+        # ---- range spinboxes ----
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        row.addWidget(QLabel("Start:"))
+        self._start_spin = QSpinBox()
+        self._start_spin.setRange(-60, 10)
+        self._start_spin.setValue(config.vna_power_range_default_start_dbm)
+        self._start_spin.setSuffix(" dBm")
+        self._start_spin.valueChanged.connect(self._on_changed)
+        row.addWidget(self._start_spin)
+
+        row.addWidget(QLabel("Stop:"))
+        self._stop_spin = QSpinBox()
+        self._stop_spin.setRange(-60, 10)
+        self._stop_spin.setValue(config.vna_power_range_default_stop_dbm)
+        self._stop_spin.setSuffix(" dBm")
+        self._stop_spin.valueChanged.connect(self._on_changed)
+        row.addWidget(self._stop_spin)
+
+        row.addWidget(QLabel("Step:"))
+        self._step_spin = QSpinBox()
+        self._step_spin.setRange(1, 20)
+        self._step_spin.setValue(config.vna_power_range_default_step_db)
+        self._step_spin.setSuffix(" dB")
+        self._step_spin.valueChanged.connect(self._on_changed)
+        row.addWidget(self._step_spin)
+
+        row.addStretch()
+        root.addLayout(row)
+
+        # ---- preview ----
+        self._preview_label = QLabel()
+        self._preview_label.setStyleSheet(
+            "color: #8B949E; font-size: 11px;"
+            "font-family: 'JetBrains Mono', 'Consolas', monospace;")
+        root.addWidget(self._preview_label)
+        self._update_preview()
+
+    def _on_changed(self):
+        self._update_preview()
+        self.selection_changed.emit()
+
+    def _update_preview(self):
+        powers = self.get_powers()
+        if not powers:
+            self._preview_label.setText("Range: — (disabled or empty)")
+            return
+        text = ", ".join(f"{v:+d}" for v in powers)
+        self._preview_label.setText(f"Range: {text}  ({len(powers)} powers)")
+
+    # ---- public API ----
+
+    def get_powers(self) -> list:
+        """Return the generated dBm list, or empty if disabled or invalid."""
+        if not self._enabled_check.isChecked():
+            return []
+        start = self._start_spin.value()
+        stop = self._stop_spin.value()
+        step = self._step_spin.value()
+        if step <= 0 or start > stop:
+            return []
+        result = []
+        v = start
+        while v <= stop + 0.001:
+            result.append(v)
+            v += step
+        return result
+
+    def get_settings(self) -> dict:
+        return {
+            "enabled": self._enabled_check.isChecked(),
+            "start_dbm": self._start_spin.value(),
+            "stop_dbm": self._stop_spin.value(),
+            "step_db": self._step_spin.value(),
+        }
+
+    def set_settings(self, s: dict):
+        if "enabled" in s:
+            self._enabled_check.setChecked(bool(s["enabled"]))
+        if "start_dbm" in s:
+            self._start_spin.setValue(int(s["start_dbm"]))
+        if "stop_dbm" in s:
+            self._stop_spin.setValue(int(s["stop_dbm"]))
+        if "step_db" in s:
+            self._step_spin.setValue(int(s["step_db"]))
+        self._update_preview()
+
+
+# ---------------------------------------------------------------------------
 # VNAPage
 # ---------------------------------------------------------------------------
 
@@ -372,10 +506,16 @@ class VNAPage(QWidget):
         return box
 
     def _build_power_box(self) -> QGroupBox:
-        box = QGroupBox("Source Power  (click to toggle, –50 to –10 dBm)")
+        box = QGroupBox("Source Power  (grid + range sweep, merged in parallel)")
         layout = QVBoxLayout(box)
         self._power_grid = VnaPowerGrid()
         layout.addWidget(self._power_grid)
+
+        # ---- range sweep (parallel to grid) ----
+        self._power_range = VnaPowerRangeWidget()
+        self._power_range.selection_changed.connect(
+            lambda: None)  # 预留信号，UI 联动可后续添加
+        layout.addWidget(self._power_range)
         return box
 
     def _build_sweep_box(self) -> QGroupBox:
@@ -440,11 +580,17 @@ class VNAPage(QWidget):
     # ==================================================================
 
     def get_all_settings(self) -> dict:
+        button_powers = self._power_grid.get_selection()
+        range_powers = self._power_range.get_powers()
+        # 并行合并：按钮点选 + 区间生成 → 并集去重升序
+        all_powers = sorted(set(button_powers + range_powers))
         return {
             "start_freq_hz": self._start_spin.value() * 1e9,
             "stop_freq_hz": self._stop_spin.value() * 1e9,
             "s_parameter": self._sparam_combo.currentText(),
-            "power_dbm": self._power_grid.get_selection(),
+            "power_dbm": all_powers,
+            "power_dbm_button": button_powers,
+            "power_range_settings": self._power_range.get_settings(),
             "points": self._points_spin.value(),
             "if_bandwidth_hz": self._ifbw_spin.value(),
         }
@@ -463,8 +609,13 @@ class VNAPage(QWidget):
             idx = self._sparam_combo.findText(settings["s_parameter"])
             if idx >= 0:
                 self._sparam_combo.setCurrentIndex(idx)
-        if "power_dbm" in settings:
+        if "power_dbm_button" in settings:
+            self._power_grid.set_selection(settings["power_dbm_button"])
+        elif "power_dbm" in settings:
+            # 向后兼容旧格式：仅有 power_dbm 时还原到按钮网格
             self._power_grid.set_selection(settings["power_dbm"])
+        if "power_range_settings" in settings:
+            self._power_range.set_settings(settings["power_range_settings"])
         if "points" in settings:
             self._points_spin.setValue(settings["points"])
         if "if_bandwidth_hz" in settings:

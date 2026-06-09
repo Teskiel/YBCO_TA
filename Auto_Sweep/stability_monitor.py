@@ -3,14 +3,20 @@
 Temperature stability monitoring algorithms.
 
 Pure algorithm module — no hardware or VISA dependencies.
-Provides multiple stability-checking methods for cryogenic temperature control.
+
+Three independent concepts:
+  - trending_stable: |window₀−window₂| ≤ 0.2K (over 2 min) → 趋于平稳
+  - in_target_zone:  |1min_avg−target| ≤ 0.5K → 进入目标区间
+  - steady_state:    3-min window max−min ≤ 0.1K → 进入稳态
+
+stable = in_target_zone AND steady_state (两者并行，无先后关系)
 
 Usage:
     from stability_monitor import AdvancedStabilityMonitor
 
     monitor = AdvancedStabilityMonitor()
     monitor.add_reading(30.05, target=30.0)
-    result = monitor.check_stability(30.0, method="custom")
+    result = monitor.check_stability(30.0)
     if result["stable"]:
         print("Ready to measure!")
 """
@@ -38,11 +44,14 @@ class TemperatureReading:
 class AdvancedStabilityMonitor:
     """Ring-buffer-based temperature stability analyser.
 
-    Supports five check methods: simple, v1, v2, v3, custom.
-    The `custom` method (default in production) uses rolling 1-minute
-    averages and a two-phase approach:
-      1. ready_for_adjust  — rate-of-change is stable
-      2. stable            — temperature is in the final measurement band
+    Uses rolling 1-minute averages for two coarse checks, plus a 3-minute
+    max-min window for steady-state detection:
+
+      Phase A — trending_stable: |window₀−window₂| ≤ 0.2K (over 2 min) → 趋于平稳
+      Phase B — in_target_zone:  |1min_avg−target| ≤ 0.5K → 进入目标区间
+      Phase C — steady_state:    3-min max−min ≤ 0.1K → 进入稳态
+
+    stable = in_target_zone AND steady_state (parallel, no ordering).
     """
 
     def __init__(self):
@@ -72,123 +81,19 @@ class AdvancedStabilityMonitor:
         current_time = time()
         return [r for r in self.readings if current_time - r.timestamp < window_seconds]
 
-    # ---- stability methods ----
+    # ---- stability method ----
 
-    def check_stability_simple(self, target_k: float, tolerance_k: float = 0.1,
-                                hold_seconds: float = 60) -> dict:
-        """All readings within ``tolerance_k`` over ``hold_seconds``."""
-        recent = self._get_recent_readings(hold_seconds)
-        if not recent:
-            return {"stable": False, "reason": "No recent data"}
+    def check_stability(self, target_k: float, method: str = "custom",
+                         settings: Optional[dict] = None) -> dict:
+        """滚动 1 分钟均值稳定性检测，含三概念分离。
 
-        temperatures = [r.temperature for r in recent]
-        all_in_tolerance = all(abs(t - target_k) <= tolerance_k for t in temperatures)
-        avg_temp = sum(temperatures) / len(temperatures)
-        max_delta = max(temperatures) - min(temperatures) if len(temperatures) > 1 else 0.0
+        三个独立概念：
+          - trending_stable (条件2): |window₀−window₂| ≤ 0.2K (over 2 min) → 趋于平稳
+          - in_target_zone  (条件3): |1min_avg−target| ≤ 0.5K → 进入目标区间
+          - steady_state    (新):   3 分钟窗口 max−min ≤ 0.1K → 进入稳态
 
-        return {
-            "stable": all_in_tolerance,
-            "method": "simple",
-            "avg_temp": avg_temp,
-            "max_delta": max_delta,
-            "reason": "All within tolerance" if all_in_tolerance else "Temperature outside tolerance",
-        }
-
-    def check_stability_v1(self, target_k: float, threshold_k: float = 0.05,
-                            window_size: int = 30) -> dict:
-        """Mean error + variance threshold over last ``window_size`` readings."""
-        if len(self.readings) < window_size:
-            return {"stable": False, "method": "v1", "reason": "Insufficient data"}
-
-        recent = self.readings[-window_size:]
-        temps = [r.temperature for r in recent]
-        mean_temp = sum(temps) / len(temps)
-        variance = sum((t - mean_temp) ** 2 for t in temps) / len(temps)
-        error = abs(mean_temp - target_k)
-
-        stable = error < threshold_k and variance < (threshold_k / 2) ** 2
-
-        return {
-            "stable": stable,
-            "method": "v1",
-            "avg_temp": mean_temp,
-            "variance": variance,
-            "error": error,
-            "threshold": threshold_k,
-            "reason": "Stable" if stable else "Error or variance too high",
-        }
-
-    def check_stability_v2(self, target_k: float, abs_threshold: float = 0.1,
-                            rel_threshold: float = 0.001, window_size: int = 20) -> dict:
-        """Absolute error, relative error, and max-delta combined check."""
-        if len(self.readings) < window_size:
-            return {"stable": False, "method": "v2", "reason": "Insufficient data"}
-
-        recent = self.readings[-window_size:]
-        temps = [r.temperature for r in recent]
-        avg_temp = sum(temps) / len(temps)
-        max_temp = max(temps)
-        min_temp = min(temps)
-
-        abs_error = abs(avg_temp - target_k)
-        rel_error = abs_error / max(abs(target_k), 1e-10)
-        max_delta = max_temp - min_temp
-
-        conditions = [
-            ("abs_error", abs_error < abs_threshold),
-            ("rel_error", rel_error < rel_threshold),
-            ("max_delta", max_delta < abs_threshold / 2),
-        ]
-
-        all_met = all(c[1] for c in conditions)
-        failed = [c[0] for c in conditions if not c[1]]
-
-        return {
-            "stable": all_met,
-            "method": "v2",
-            "avg_temp": avg_temp,
-            "max_delta": max_delta,
-            "abs_error": abs_error,
-            "rel_error": rel_error,
-            "reason": "All conditions met" if all_met else f'Failed: {", ".join(failed)}',
-        }
-
-    def check_stability_v3(self, target_k: float, window_seconds: float = 60,
-                            threshold_k: float = 0.02) -> dict:
-        """Standard deviation + relaxed error threshold over a time window."""
-        recent = self._get_recent_readings(window_seconds)
-
-        if len(recent) < 5:
-            return {"stable": False, "method": "v3", "reason": "Insufficient data"}
-
-        temps = [r.temperature for r in recent]
-        avg_temp = sum(temps) / len(temps)
-        n = len(temps)
-        std_dev = (sum((t - avg_temp) ** 2 for t in temps) / n) ** 0.5
-        error = abs(avg_temp - target_k)
-
-        stable = error < threshold_k * 5 and std_dev < threshold_k
-
-        return {
-            "stable": stable,
-            "method": "v3",
-            "avg_temp": avg_temp,
-            "std_dev": std_dev,
-            "error": error,
-            "reason": "Stable" if stable else "Error or std dev too high",
-        }
-
-    def check_stability_custom(self, target_k: float,
-                                settings: Optional[dict] = None) -> dict:
-        """Custom stability check using rolling 1-minute averages.
-
-        Criteria:
-          1. 1-min average within ±avg_tolerance_k of target
-          2. Delta between consecutive 1-min averages < delta_tolerance_k
-          3. Latest average within ±final_stable_band_k of target (→ stable=True)
-
-        ``ready_for_adjust`` is True when condition 2 is met (rate stable),
-        even if the temperature is not yet at the target.
+        ``stable`` = in_target_zone AND steady_state（两者并行，无先后关系）。
+        ``ready_for_adjust`` = trending_stable（用于触发设定点过冲调整）。
         """
         if settings is None:
             from config import custom_stability_settings as settings
@@ -199,9 +104,14 @@ class AdvancedStabilityMonitor:
         final_band = settings.get("final_stable_band_k", 0.3)
         min_readings = settings.get("min_readings_required", 6)
 
+        # 稳态判定参数
+        from config import steady_state_max_min_k, steady_state_window_s
+        ss_max_min = steady_state_max_min_k
+        ss_window = steady_state_window_s
+
         current_time = time()
 
-        # readings from last 3 minutes
+        # 回溯窗口内的读数
         all_recent = [r for r in self.readings if current_time - r.timestamp < 180]
 
         if len(all_recent) < min_readings:
@@ -211,11 +121,15 @@ class AdvancedStabilityMonitor:
                 "reason": f"Need at least {min_readings} readings, have {len(all_recent)}",
                 "avg_temp": None,
                 "avg_delta": None,
+                "trending_stable": False,
+                "in_target_zone": False,
+                "steady_state": False,
+                "max_min_3min": None,
                 "in_final_band": False,
                 "ready_for_adjust": False,
             }
 
-        # rolling 1-minute averages
+        # ---- 滚动 1 分钟均值窗口 ----
         minute_windows = []
         for i in range(3):
             window_start = current_time - (i + 1) * avg_window
@@ -242,62 +156,72 @@ class AdvancedStabilityMonitor:
                 "reason": "No valid 1-minute windows",
                 "avg_temp": None,
                 "avg_delta": None,
+                "trending_stable": False,
+                "in_target_zone": False,
+                "steady_state": False,
+                "max_min_3min": None,
                 "in_final_band": False,
                 "ready_for_adjust": False,
             }
 
         latest_avg = minute_windows[0]["avg"]
+
+        # ---- 条件 1: 粗判（1-min 均值在 ±avg_tolerance 内） ----
         condition1 = abs(latest_avg - target_k) <= avg_tolerance
 
+        # ---- 条件 2: 趋于平稳（跨 2 分钟窗口均值变化 < delta_tolerance） ----
         condition2 = False
         avg_delta = None
-        if len(minute_windows) >= 2:
-            avg_delta = abs(minute_windows[0]["avg"] - minute_windows[1]["avg"])
+        if len(minute_windows) >= 3:
+            # 窗口 [0]=最新, [2]=2分钟前 → 跨 2 分钟的比较
+            avg_delta = abs(minute_windows[0]["avg"] - minute_windows[2]["avg"])
             condition2 = avg_delta <= delta_tolerance
 
+        # ---- 条件 3: 进入目标区间（1-min 均值在 ±final_band 内） ----
         condition3 = abs(latest_avg - target_k) <= final_band
 
-        stable_for_adjust = condition2
-        stable_for_measure = condition3
+        # ---- 稳态判定: 3 分钟窗口 max-min ≤ ss_max_min ----
+        steady_readings = [
+            r for r in self.readings
+            if current_time - r.timestamp <= ss_window
+        ]
+        max_min_3min = None
+        steady_state = False
+        if len(steady_readings) >= 6:
+            temps = [r.temperature for r in steady_readings]
+            max_min_3min = max(temps) - min(temps)
+            steady_state = max_min_3min <= ss_max_min
+
+        # ---- 汇总 ----
+        trending_stable = condition2
+        in_target_zone = condition3
+        is_stable = in_target_zone and steady_state
 
         reasons = []
         if not condition1:
-            reasons.append(f"Average {latest_avg:.3f}K not within ±{avg_tolerance}K of target")
-        if not condition2 and len(minute_windows) >= 2:
-            reasons.append(f"Average delta {avg_delta:.3f}K > {delta_tolerance}K")
+            reasons.append(f"1-min avg {latest_avg:.3f}K not within ±{avg_tolerance}K of target")
+        if not condition2 and avg_delta is not None:
+            reasons.append(f"2 分钟窗口漂移 {avg_delta:.3f}K > {delta_tolerance}K（未趋于平稳）")
         if not condition3:
-            reasons.append(f"Not within final stable band ±{final_band}K")
+            reasons.append(f"未进入目标区间 ±{final_band}K（Δ={abs(latest_avg - target_k):.3f}K）")
+        if not steady_state:
+            if max_min_3min is not None:
+                reasons.append(f"未进入稳态: 3min max-min={max_min_3min:.3f}K > {ss_max_min}K")
+            else:
+                reasons.append(f"稳态数据不足（需 ≥6 个读数在 {ss_window}s 内）")
 
         return {
-            "stable": stable_for_measure,
+            "stable": is_stable,
             "method": "custom",
             "avg_temp": latest_avg,
             "avg_delta": avg_delta,
-            "in_final_band": condition3,
-            "ready_for_adjust": stable_for_adjust,
-            "reason": "All conditions met" if stable_for_measure else f'Failed: {", ".join(reasons)}',
+            "trending_stable": trending_stable,
+            "in_target_zone": in_target_zone,
+            "steady_state": steady_state,
+            "max_min_3min": max_min_3min,
+            "in_final_band": in_target_zone,
+            "ready_for_adjust": trending_stable,
+            "reason": "Stable" if is_stable else f'Failed: {", ".join(reasons)}',
             "minute_windows": minute_windows,
         }
 
-    # ---- dispatcher ----
-
-    def check_stability(self, target_k: float, method: str = "v2") -> dict:
-        """Route to the appropriate stability method by name."""
-        if method == "simple":
-            from config import temperature_tolerance_k
-            return self.check_stability_simple(
-                target_k, tolerance_k=temperature_tolerance_k)
-        elif method == "v1":
-            return self.check_stability_v1(target_k)
-        elif method == "v2":
-            return self.check_stability_v2(target_k)
-        elif method == "v3":
-            return self.check_stability_v3(target_k)
-        elif method == "custom":
-            return self.check_stability_custom(target_k)
-        else:
-            return {
-                "stable": False,
-                "method": method,
-                "reason": f"Unknown method: {method}",
-            }

@@ -106,8 +106,8 @@ temp_reader = LakeShore335(visa_address= "ASRL4::INSTR")
 laser = KeysightLaser(laser_resource)
 
 # 基础目录设定
-date = "20260529"
-base_folder = rf'D:\YBCO\VNAMeas\data\{date}\-45dBm'
+date = "20260609"
+base_folder = rf'D:\YBCO\VNAMeas\data\{date}\-40dBm'
 
 # 你需要扫描的功率列表 (单位: mW)
 power_levels = [0, 1, 3, 5, 7, 9, 11, 13, 15, 17]
@@ -135,7 +135,7 @@ for power in power_levels:
     # 可以用一个倒计时打印，避免程序看起来像卡死了
     
     # sleep(10)
-    for remaining in range(180, 0, -10):
+    for remaining in range(20, 0, -10):
         print(f"剩余等待时间: {remaining} 秒")
         sleep(10)
         

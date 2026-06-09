@@ -421,10 +421,80 @@ def test_given_all_readings_in_band_when_checking_then_returns_stable(self):
 
 ---
 
+## 版本历史
+
+### v1.1 (2026-06-09) — 可视化与测量逻辑增强
+
+**新增模块**
+
+| 模块 | 说明 |
+|---|---|
+| `plot_dashboard/` | 交互式 PyQt5 数据可视化面板 — 支持按温度/功率/VNA 功率筛选、批量 S₂₁ 叠加图绘制、Q 值面板 |
+| `readme_generator.py` | 实验数据头部 `readme.txt` 自动生成器 — 包含设备参数、实验时长、环境温度、操作人员 |
+| `draw/plot_laser_powersweep.py` | 固定 (Tr, Pv) 下多激光功率 S₂₁ 叠加图绘制脚本 |
+
+**测量逻辑改进**
+
+| 改进 | 说明 |
+|---|---|
+| 双阶段轮询 | 稀疏轮询（30s，趋于平稳前）→ 密集轮询（5s，进入目标区间后），加速稳态判定 |
+| 稳态检测 | 新增 3 分钟窗口 max−min ≤ 0.1K 独立稳态判据，与目标区间判定并行 |
+| 测量逻辑版本号 | `config.MEASUREMENT_LOGIC_VERSION = "2026-06-08"`，写入数据头部便于回溯 |
+| VNA 功率区间扫描 | GUI 新增功率区间模式（start/stop/step），与固定功率按钮网格并行 |
+| 实验重试机制 | S₂₁ 偏差超过阈值（0.5 dB）时自动重测（最多 2 次） |
+| 低温超时保护 | 30 分钟超时，防止低温区无限等待 |
+
+**配置与架构**
+
+| 改动 | 说明 |
+|---|---|
+| `config.py` 新增 8 组常量 | 稳态判定、双阶段轮询、功率扫描、重试参数、版本号等 |
+| `temperature_diagnostics.py` → 删除 | 已被 `temperature_state_diagnostics.py`（7 状态分类器）完全替代 |
+| `stability_monitor.py` 重构 | 简化接口，融入稳态检测逻辑 |
+| `ui/vna_page.py` | 新增 VNA 功率区间扫描 UI |
+| `ui/workers.py` | 集成重试逻辑、功率区间扫描、readme 自动生成 |
+| `ui/experiment_stability_controller.py` | 重构稳定性状态机 |
+
+**文档**
+
+| 文件 | 说明 |
+|---|---|
+| `README.md` | 完整项目文档 — 物理背景、变量空间、硬件拓扑、6 张参数映射表 |
+| `CLAUDE.md` | AI 辅助开发文档 — 架构图、文件地图、修改指南 |
+
+**测试**
+
+- 新增 3 个测试文件：`test_readme_generator.py`、`test_vna_power_sweep.py`、`test_measurement_retry.py`
+- 扩展 4 个已有测试文件：`test_config.py`、`test_stability_monitor.py`、`test_stability_fallback.py`、`test_experiment_worker.py`
+- 测试总数：263 passed, 30 skipped（skipped = 待实现的 TDD Red 阶段用例）
+
+**数据清理**
+
+- 从版本库移除所有 `.s2p`、`.txt`、`.csv` 数据文件及日志
+- 完善 `.gitignore`：排除实验数据、压缩包、临时文件
+
+---
+
+### v1.0 (2026-06-05) — 初始版本
+
+- 三层自动化测量：温控（LakeShore 335）→ 激光功率扫描（Keysight N7779C）→ VNA S 参数采集（Keysight PXI）
+- PyQt5 GUI 控制面板（Dashboard / Laser / LakeShore / VNA 四页）
+- CLI 命令行运行 (`power_sweep_auto.py`)
+- 独立温度爬坡控制器 (`lakeshore335_ramp.py`)
+- 温度稳定性判定（6 种方法，默认 custom 双阶段协议）
+- PID 参数按温区查表（3 温区：Low/Medium/High）
+- 自动重连机制（连接断开后 3 次重试）
+- 温度安全互锁（降温前自动关加热器等待）
+- JSON 预设管理系统
+- BDD/TDD 测试套件（pytest，200+ 用例）
+- 自动设置持久化（`app_settings.json`）
+
+---
+
 ## 引用
 
 如果本项目对你的研究有帮助，请引用相关论文（待补充）。
 
 ---
 
-*维护者：Teskiel · 最后更新：2026-06*
+*维护者：Teskiel · 最后更新：2026-06-09*

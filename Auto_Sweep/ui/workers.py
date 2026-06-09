@@ -530,24 +530,99 @@ class ExperimentWorker(QObject):
         except Exception as e:
             self.progress.emit(f"  设定点写入失败: {e}")
 
+    # ------------------------------------------------------------------
+    # 测量时温度监控
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_measurement_temp(pre_k: float, post_k: float,
+                                 target_k: float) -> tuple:
+        """检查测量前后的温度是否满足稳态条件。
+
+        Args:
+            pre_k: 测量前实际温度 (K)
+            post_k: 测量后实际温度 (K)
+            target_k: 目标温度 (K)
+
+        Returns:
+            (ok: bool, reason: str)
+        """
+        # 测量前温度偏离 > ±0.5K
+        if abs(pre_k - target_k) > 0.5:
+            return (False,
+                    f"测量前温度偏离: {pre_k:.3f}K vs target {target_k:.1f}K "
+                    f"(Δ={abs(pre_k-target_k):.3f}K > 0.5K)")
+
+        # 测量后温度偏离 > ±0.5K
+        if abs(post_k - target_k) > 0.5:
+            return (False,
+                    f"测量后温度偏离: {post_k:.3f}K vs target {target_k:.1f}K "
+                    f"(Δ={abs(post_k-target_k):.3f}K > 0.5K)")
+
+        # 测量期间温度跳变 > 0.3K
+        delta = abs(post_k - pre_k)
+        if delta > 0.3:
+            return (False,
+                    f"测量期间温度跳变: |{post_k:.3f} - {pre_k:.3f}|"
+                    f" = {delta:.3f}K > 0.3K")
+
+        return (True, "")
+
+    # ------------------------------------------------------------------
+    # 实验主循环
+    # ------------------------------------------------------------------
+
     @pyqtSlot()
     def run(self):
         try:
-            from time import sleep, time
+            from datetime import datetime
+            import time as _time
             import os
+            import config
 
             self.experiment_started.emit()
             count = 0
+            start_time = datetime.now()
+
+            # ---- 创建日志目录并打开日志文件 ----
+            log_dir = os.path.join(self._output_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(
+                log_dir,
+                f"experiment_log_{start_time.strftime('%Y%m%d_%H%M%S')}.txt")
+
+            # 先定义 _log（使用临时占位，稍后替换为真实文件）
+            def _log_fallback(msg: str):
+                self.progress.emit(msg)
+
+            def _log(msg: str):
+                """同时写入 GUI 信号和日志文件。"""
+                ts = _time.strftime(
+                    "[%Y-%m-%d %H:%M:%S] ", _time.localtime(_time.time()))
+                self.progress.emit(msg)
+                log_file.write(ts + msg + "\n")
+                log_file.flush()
+
+            try:
+                log_file = open(log_path, "w", encoding="utf-8")
+            except (OSError, IOError) as _log_open_err:
+                import io
+                log_file = io.StringIO()
+                self.progress.emit(
+                    f"  ⚠ 无法创建日志文件: {_log_open_err}，使用内存缓冲")
+
+            _log(f"实验开始 — 输出目录: {self._output_dir}")
+            _log(f"温度列表: {self._temp_list}")
+            _log(f"激光功率列表: {self._power_list} mW")
+            _log(f"VNA 功率列表: {self._vna_power_list} dBm")
 
             for target_k in self._temp_list:
                 if self._abort_flag:
                     self.experiment_aborted.emit()
+                    log_file.close()
                     return
 
-                # 重置纯P模式日志标记
-                self._pure_p_logged = False
-
-                self.progress.emit(f"→ Stabilising to {target_k:.1f} K ...")
+                _log(f"→ Stabilising to {target_k:.1f} K ...")
 
                 # ---- 读取当前温度 ----
                 actual_k = target_k
@@ -557,10 +632,9 @@ class ExperimentWorker(QObject):
                         if actual_k is None:
                             actual_k = target_k
                 except Exception as e:
-                    self.progress.emit(
-                        f"  ⚠ 初始温度读取失败: {e}，使用 target={target_k:.1f}K 作为回退")
+                    _log(f"  ⚠ 初始温度读取失败: {e}，使用 target={target_k:.1f}K 作为回退")
 
-                # ---- 初始化简化版稳定性控制器（固定PID + 仅调整设定点） ----
+                # ---- 初始化稳定性控制器 ----
                 from ui.experiment_stability_controller import (
                     ExperimentStabilityController,
                 )
@@ -570,13 +644,9 @@ class ExperimentWorker(QObject):
                     current_temperature=actual_k,
                 )
 
-                # ---- 确保加热器在 Medium 档位（必须在写 PID 和设定点之前） ----
+                # ---- 确保加热器在 Medium 档位 ----
                 if self._lakeshore_ctrl:
-                    self._lakeshore_ctrl.set_heater_range(1, 2)  # 强制 Medium
-
-                # ---- 确保加热器在 Medium 档位（必须在写 PID 和设定点之前） ----
-                if self._lakeshore_ctrl:
-                    self._lakeshore_ctrl.set_heater_range(1, 2)  # 强制 Medium
+                    self._lakeshore_ctrl.set_heater_range(1, 2)
 
                 # ---- 写入固定 PID（仅一次，永不调整） ----
                 fixed_pid = stability_ctrl.get_fixed_pid()
@@ -591,17 +661,18 @@ class ExperimentWorker(QObject):
                     overshoot_info = ""
                     if stability_ctrl.current_overshoot > 0.01:
                         overshoot_info = f" (overshoot +{stability_ctrl.current_overshoot:.1f}K)"
-                    self.progress.emit(
-                        f"  温区 PID: P={fixed_pid['p']:g}/"
-                        f"I={fixed_pid['i']:g}/D={fixed_pid['d']:g}, "
-                        f"设定点 → {setpoint_k:.3f} K{overshoot_info}")
+                    _log(f"  温区 PID: P={fixed_pid['p']:g}/"
+                         f"I={fixed_pid['i']:g}/D={fixed_pid['d']:g}, "
+                         f"设定点 → {setpoint_k:.3f} K{overshoot_info}")
 
-                # ---- 等待稳定性 ----
-                start_t = time()
+                # ---- 等待稳定性（2 阶段轮询） ----
+                start_t = _time.time()
+                prev_phase = "sparse"
 
                 while True:
                     if self._abort_flag:
                         self.experiment_aborted.emit()
+                        log_file.close()
                         return
 
                     # 读取温度
@@ -609,7 +680,7 @@ class ExperimentWorker(QObject):
                         actual_k = self._lakeshore_ctrl.get_temperature("A") \
                             if self._lakeshore_ctrl else target_k
                     except Exception:
-                        sleep(10)
+                        _time.sleep(10)
                         continue
 
                     if actual_k is None:
@@ -619,8 +690,15 @@ class ExperimentWorker(QObject):
                     stability_ctrl.add_reading(actual_k)
                     self.temperature_stabilizing.emit(target_k, actual_k)
 
-                    elapsed = time() - start_t
+                    elapsed = _time.time() - start_t
                     result = stability_ctrl.check(elapsed)
+
+                    # 阶段转换日志
+                    if stability_ctrl.phase.value != prev_phase:
+                        prev_phase = stability_ctrl.phase.value
+                        if prev_phase == "fine":
+                            _log(f"  进入 Phase 2（趋于平稳），提高轮询频率至 "
+                                 f"{config.fine_poll_seconds}s，并行判目标区间+稳态")
 
                     # 检查是否需要调整设定点过冲
                     new_sp = stability_ctrl.needs_setpoint_adjustment()
@@ -635,122 +713,295 @@ class ExperimentWorker(QObject):
                     # 处理结果
                     if result.stable:
                         self.temperature_stable.emit(target_k, actual_k)
-                        self.progress.emit(
-                            f"  Stable at {actual_k:.3f} K "
-                            f"(target {target_k:.1f} K)")
+                        _log(f"  稳定: {actual_k:.3f} K "
+                             f"(target {target_k:.1f} K, "
+                             f"phase={stability_ctrl.phase.value})")
                         break
                     elif result.reason == "good_enough":
-                        self.progress.emit(
-                            f"  ±0.5K 以内足够接近 — "
-                            f"avg={result.avg_temp:.3f}K vs "
-                            f"target={target_k:.1f}K，继续测量")
+                        _log(f"  good_enough — "
+                             f"avg={result.avg_temp:.3f}K vs "
+                             f"target={target_k:.1f}K "
+                             f"(phase={stability_ctrl.phase.value})，继续测量")
                         self.temperature_stable.emit(target_k, actual_k)
                         break
                     elif result.reason == "timeout":
-                        self.progress.emit(
-                            f"  Timeout at {target_k:.1f}K — "
-                            f"avg={result.avg_temp:.3f}K, "
-                            f"Δ={abs(result.avg_temp - target_k):.3f}K")
+                        _log(f"  Timeout at {target_k:.1f}K — "
+                             f"avg={result.avg_temp:.3f}K, "
+                             f"Δ={abs(result.avg_temp - target_k):.3f}K")
                         self.temperature_stable.emit(target_k, actual_k)
                         break
 
-                    sleep(10)
+                    # 阶段感知轮询间隔
+                    poll_s = (config.fine_poll_seconds
+                              if stability_ctrl.phase.value == "fine"
+                              else config.sparse_poll_seconds)
+                    _time.sleep(poll_s)
 
-                # ---- VNA power sweep + laser power sweep ----
+                # ============================================================
+                # VNA power sweep + laser power sweep（含测量时温度监控）
+                # ============================================================
+                MAX_MEASUREMENT_RESTARTS = 3  # 单个温度点最多重启测量次数
+
                 # 确保至少有一个 VNA 功率值
                 vna_powers = list(self._vna_power_list) if self._vna_power_list else []
                 if not vna_powers:
                     fallback = self._vna_settings.get("power_dbm", [-45])
-                    # 确保 fallback 是扁平列表
                     if isinstance(fallback, list):
                         vna_powers = list(fallback)
                     else:
                         vna_powers = [fallback]
                 vna_powers = sorted(set(vna_powers))
 
-                # Apply VNA freq + S-param once per temperature (same for all powers)
-                if self._vna and self._vna_settings:
-                    vs = self._vna_settings
-                    self._vna.write(
-                        f":SENSe:FREQuency:STARt "
-                        f"{vs.get('start_freq_hz', 3e9):.0f}")
-                    self._vna.write(
-                        f":SENSe:FREQuency:STOP "
-                        f"{vs.get('stop_freq_hz', 6e9):.0f}")
-                    if vs.get("s_parameter"):
-                        sp = vs["s_parameter"]
-                        self._vna.write(
-                            f':CALCulate:PARameter:DELete:ALL')
-                        self._vna.write(
-                            f':CALCulate:PARameter:DEFine:EXTended '
-                            f'"{sp}","{sp}"')
-                        self._vna.write(
-                            f':DISPlay:WINDow1:TRACe1:FEED "{sp}"')
+                # 测量重启循环
+                measurement_restarts = 0
+                while True:
+                    measurement_ok = True
+                    deleted_any = False
 
-                for vna_dbm in vna_powers:
-                    if self._abort_flag:
-                        self.experiment_aborted.emit()
-                        return
+                    # Apply VNA freq + S-param once per restart
+                    if self._vna and self._vna_settings:
+                        vs = self._vna_settings
+                        self._vna.write(
+                            f":SENSe:FREQuency:STARt "
+                            f"{vs.get('start_freq_hz', 3e9):.0f}")
+                        self._vna.write(
+                            f":SENSe:FREQuency:STOP "
+                            f"{vs.get('stop_freq_hz', 6e9):.0f}")
+                        if vs.get("s_parameter"):
+                            sp = vs["s_parameter"]
+                            self._vna.write(
+                                f':CALCulate:PARameter:DELete:ALL')
+                            self._vna.write(
+                                f':CALCulate:PARameter:DEFine:EXTended '
+                                f'"{sp}","{sp}"')
+                            self._vna.write(
+                                f':DISPlay:WINDow1:TRACe1:FEED "{sp}"')
 
-                    # set VNA source power
-                    if self._vna:
-                        self._vna.write(f":SOURce:POWer {vna_dbm}")
+                    for vna_dbm in vna_powers:
+                        if self._abort_flag or not measurement_ok:
+                            break
 
-                    for power_mw in self._power_list:
+                        # set VNA source power
+                        if self._vna:
+                            self._vna.write(f":SOURce:POWer {vna_dbm}")
+
+                        for power_mw in self._power_list:
+                            if self._abort_flag:
+                                self.experiment_aborted.emit()
+                                log_file.close()
+                                return
+
+                            # ---- 测量前读取温度 ----
+                            pre_temp = actual_k
+                            try:
+                                if self._lakeshore_ctrl:
+                                    t = self._lakeshore_ctrl.get_temperature("A")
+                                    if t is not None:
+                                        pre_temp = t
+                            except Exception:
+                                pass
+
+                            self.measurement_started.emit(pre_temp, power_mw)
+                            _log(f"  Measuring {vna_dbm:+d} dBm / "
+                                 f"{power_mw} mW @ {pre_temp:.3f} K")
+
+                            # apply laser
+                            if self._laser_ctrl:
+                                if power_mw == 0:
+                                    self._laser_ctrl.output_off()
+                                else:
+                                    self._laser_ctrl.set_power(power_mw)
+                                    self._laser_ctrl.output_on()
+                                _time.sleep(20)  # optical settle
+
+                            # ---- 输出路径 ----
+                            temp_str = f"{target_k:.0f}K"
+                            folder = os.path.join(
+                                self._output_dir, temp_str,
+                                f"{vna_dbm:+d}dBm",
+                                f"{power_mw:02d}mW")
+                            os.makedirs(folder, exist_ok=True)
+                            filename = (
+                                f"YBCO_{vna_dbm:+d}dBm_"
+                                f"{power_mw:02d}mW_target_{temp_str}"
+                                f"_actual_{pre_temp:.3f}K.s2p")
+                            filepath = os.path.join(folder, filename)
+
+                            # sweep + save S2P
+                            if self._vna:
+                                vna_safe = filepath.replace("\\", "/")
+                                self._vna.write(":INITiate:CONTinuous OFF")
+                                self._vna.write(":INITiate:IMMediate")
+                                try:
+                                    self._vna.query("*OPC?")
+                                except Exception:
+                                    _time.sleep(5)
+                                self._vna.write(
+                                    f'MMEMory:STORe "{vna_safe}"')
+                                count += 1
+
+                            # ---- 测量后读取温度 ----
+                            post_temp = pre_temp
+                            try:
+                                if self._lakeshore_ctrl:
+                                    t = self._lakeshore_ctrl.get_temperature("A")
+                                    if t is not None:
+                                        post_temp = t
+                            except Exception:
+                                pass
+
+                            # ---- 测量时温度监控 ----
+                            temp_ok, temp_reason = self._check_measurement_temp(
+                                pre_temp, post_temp, target_k)
+
+                            if not temp_ok:
+                                _log(f"  ⚠ 测量温度异常: {temp_reason}")
+                                # 删除异常数据文件
+                                try:
+                                    if os.path.exists(filepath):
+                                        os.remove(filepath)
+                                        _log(f"  已删除异常数据: {filename}")
+                                except Exception as e:
+                                    _log(f"  删除文件失败: {e}")
+
+                                count -= 1
+                                measurement_ok = False
+                                deleted_any = True
+                                break  # 跳出功率循环
+
+                            self.measurement_complete.emit(
+                                post_temp, power_mw, filepath)
+                            # 更新 actual_k 为最新温度
+                            actual_k = post_temp
+
+                        if not measurement_ok:
+                            break  # 跳出 VNA 功率循环
+
+                    if measurement_ok:
+                        # 测量全部通过
+                        break
+
+                    # ---- 测量异常 → 重启稳定性 ----
+                    measurement_restarts += 1
+                    _log(f"  ⚠ 测量重启 #{measurement_restarts}"
+                         f"/{MAX_MEASUREMENT_RESTARTS} — 重新等待温度稳定")
+
+                    if measurement_restarts >= MAX_MEASUREMENT_RESTARTS:
+                        _log(f"  ⚠ 已达最大测量重启次数"
+                             f"({MAX_MEASUREMENT_RESTARTS})，"
+                             f"以 good_enough 模式继续")
+                        break
+
+                    # 重新等待稳定性
+                    stability_ctrl.setup(
+                        target_k=target_k,
+                        current_temperature=actual_k,
+                    )
+                    if self._lakeshore_ctrl:
+                        new_fixed_pid = stability_ctrl.get_fixed_pid()
+                        self._lakeshore_ctrl.set_pid(
+                            new_fixed_pid["p"], new_fixed_pid["i"],
+                            new_fixed_pid["d"], loop=1)
+                        new_sp = stability_ctrl.needs_setpoint_adjustment()
+                        if new_sp is not None:
+                            self._lakeshore_ctrl.set_temperature(new_sp, loop=1)
+
+                    restart_start = _time.time()
+                    while True:
                         if self._abort_flag:
                             self.experiment_aborted.emit()
+                            log_file.close()
                             return
+                        try:
+                            actual_k = self._lakeshore_ctrl.get_temperature("A") \
+                                if self._lakeshore_ctrl else target_k
+                        except Exception:
+                            _time.sleep(10)
+                            continue
+                        if actual_k is None:
+                            actual_k = target_k
 
-                        self.measurement_started.emit(actual_k, power_mw)
-                        self.progress.emit(
-                            f"  Measuring {vna_dbm:+d} dBm / "
-                            f"{power_mw} mW @ {actual_k:.3f} K")
+                        stability_ctrl.add_reading(actual_k)
+                        self.temperature_stabilizing.emit(target_k, actual_k)
 
-                        # apply laser
-                        if self._laser_ctrl:
-                            if power_mw == 0:
-                                self._laser_ctrl.output_off()
-                            else:
-                                self._laser_ctrl.set_power(power_mw)
-                                self._laser_ctrl.output_on()
-                            sleep(20)  # optical settle
+                        elapsed = _time.time() - restart_start
+                        result = stability_ctrl.check(elapsed)
 
-                        # output path
-                        temp_str = f"{target_k:.0f}K"
-                        folder = os.path.join(
-                            self._output_dir, temp_str,
-                            f"actual_{actual_k:.3f}K",
-                            f"{vna_dbm:+d}dBm",
-                            f"{power_mw:02d}mW")
-                        os.makedirs(folder, exist_ok=True)
-                        filename = (
-                            f"YBCO_{vna_dbm:+d}dBm_"
-                            f"{power_mw:02d}mW_target_{temp_str}"
-                            f"_actual_{actual_k:.3f}K.s2p")
-                        filepath = os.path.join(folder, filename)
+                        new_sp = stability_ctrl.needs_setpoint_adjustment()
+                        if new_sp is not None:
+                            self._apply_setpoint_adjustment(
+                                new_sp,
+                                stability_ctrl.current_overshoot,
+                                stability_ctrl.base_overshoot,
+                                actual_k,
+                            )
 
-                        # sweep + save S2P
-                        if self._vna:
-                            vna_safe = filepath.replace("\\", "/")
-                            self._vna.write(":INITiate:CONTinuous OFF")
-                            self._vna.write(":INITiate:IMMediate")
-                            try:
-                                self._vna.query("*OPC?")
-                            except Exception:
-                                sleep(5)
-                            self._vna.write(
-                                f'MMEMory:STORe "{vna_safe}"')
-                            count += 1
+                        if result.stable or result.reason == "good_enough":
+                            _log(f"  重启后稳定: {actual_k:.3f} K")
+                            self.temperature_stable.emit(target_k, actual_k)
+                            break
+                        elif result.reason == "timeout":
+                            _log(f"  重启超时 — 以 good_enough 模式继续")
+                            break
 
-                        self.measurement_complete.emit(
-                            actual_k, power_mw, filepath)
+                        poll_s = (config.fine_poll_seconds
+                                  if stability_ctrl.phase.value == "fine"
+                                  else config.sparse_poll_seconds)
+                        _time.sleep(poll_s)
 
-                # 关闭激光，准备下一个温度点
+                # 切换到下一个温度点前：激光功率归零
                 if self._laser_ctrl:
+                    self._laser_ctrl.set_power(0)
                     self._laser_ctrl.output_off()
+                    _log(f"  温度点完成，激光功率 → 0 mW（准备升温）")
 
+            # ================================================================
+            # 实验完成 — 生成 readme.txt
+            # ================================================================
+            end_time = datetime.now()
+            _log(f"Experiment complete — {count} measurements")
+
+            try:
+                from readme_generator import generate_readme
+                import config
+
+                # 收集设备参数
+                laser_params = {
+                    "wavelength_nm": self._vna_settings.get("laser_wavelength_nm",
+                        getattr(self._laser_ctrl, "_wavelength", None) or 1550.0),
+                    "power_sequence_mw": self._power_list,
+                }
+                lakeshore_params = {
+                    "setpoint_k": self._temp_list[0] if self._temp_list else "—",
+                    "pid": fixed_pid if 'fixed_pid' in dir() else {},
+                    "heater_range": 2,
+                }
+                vna_info = dict(self._vna_settings)
+                vna_info["address"] = getattr(
+                    self._vna, "_resource_name", "—") if self._vna else "—"
+
+                readme_path = generate_readme(
+                    output_dir=self._output_dir,
+                    start_time=start_time,
+                    end_time=end_time,
+                    laser_params=laser_params,
+                    lakeshore_params=lakeshore_params,
+                    vna_params=vna_info,
+                    measurement_count=count,
+                    measurement_logic_version=getattr(
+                        config, "MEASUREMENT_LOGIC_VERSION", ""),
+                )
+                _log(f"readme.txt generated: {readme_path}")
+            except Exception as e:
+                _log(f"⚠ readme.txt 生成失败: {e}")
+
+            _log(f"日志文件: {log_path}")
+            log_file.close()
             self.experiment_finished.emit(count)
-            self.progress.emit(f"Experiment complete — {count} measurements")
 
         except Exception as e:
             self.experiment_error.emit(f"Experiment failed: {e}")
+            try:
+                log_file.close()
+            except Exception:
+                pass
