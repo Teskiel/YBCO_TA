@@ -1439,3 +1439,101 @@ class TestCheckpointManager:
                             [-45, -30],
                             [0, 1, 3, 5, 7, 9]))
             assert is_match is True
+
+
+# =========================================================================
+# 断点续传: 异常分类测试
+# =========================================================================
+
+class TestRecoverableErrorDetection:
+    """验证 _is_recoverable_error() 正确区分连接错误和逻辑错误。"""
+
+    @staticmethod
+    def _is_recoverable(exc):
+        from ui.workers import ExperimentWorker
+        return ExperimentWorker._is_recoverable_error(exc)
+
+    def test_given_vi_error_conn_lost_when_checking_then_recoverable(self):
+        """VI_ERROR_CONN_LOST → 可恢复。"""
+        exc = Exception("VI_ERROR_CONN_LOST (-1073807194): "
+                        "The connection for the given session has been lost.")
+        assert self._is_recoverable(exc) is True
+
+    def test_given_timeout_when_checking_then_recoverable(self):
+        """含 timeout 关键字 → 可恢复。"""
+        assert self._is_recoverable(Exception("VISA timeout on read")) is True
+
+    def test_given_disconnected_when_checking_then_recoverable(self):
+        """含 disconnected → 可恢复。"""
+        assert self._is_recoverable(Exception("Device disconnected")) is True
+
+    def test_given_tcpip_error_when_checking_then_recoverable(self):
+        """含 tcpip → 可恢复。"""
+        assert self._is_recoverable(Exception("TCPIP connection refused")) is True
+
+    def test_given_value_error_when_checking_then_not_recoverable(self):
+        """普通 ValueError → 不可恢复。"""
+        assert self._is_recoverable(ValueError("invalid literal for float()")) is False
+
+    def test_given_key_error_when_checking_then_not_recoverable(self):
+        """KeyError → 不可恢复。"""
+        assert self._is_recoverable(KeyError("missing_key")) is False
+
+    def test_given_data_parse_error_when_checking_then_not_recoverable(self):
+        """数据解析失败 → 不可恢复。"""
+        assert self._is_recoverable(Exception("could not convert string to float")) is False
+
+
+# =========================================================================
+# 断点续传: S2P 文件去重测试
+# =========================================================================
+
+class TestS2PFilenameDedup:
+    """验证 _find_next_filename() 的 attempt 自动递增。"""
+
+    @staticmethod
+    def _find_next(folder, temp_k, vna_dbm, power_mw, actual_k):
+        from ui.workers import ExperimentWorker
+        return ExperimentWorker._find_next_filename(
+            folder, temp_k, vna_dbm, power_mw, actual_k)
+
+    def test_given_no_existing_file_when_finding_then_attempt_0(self):
+        """无同名文件 → 返回 attempt=0（无 attempt 后缀）。"""
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            name = self._find_next(tmpdir, 30.0, -45, 0, 29.995)
+            assert "attempt" not in name
+            assert name.endswith("_actual_29.995K.s2p")
+
+    def test_given_file_exists_when_finding_then_increments_attempt(self):
+        """已有 attempt=0 的文件 → 返回 attempt=1。"""
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            existing = _os.path.join(
+                tmpdir,
+                "YBCO_-45dBm_00mW_target_30K_actual_29.995K.s2p")
+            with open(existing, "w") as f:
+                f.write("dummy")
+            name = self._find_next(tmpdir, 30.0, -45, 0, 29.995)
+            assert "attempt1" in name
+
+    def test_given_multiple_attempts_when_finding_then_uses_next_available(self):
+        """已有 attempt=0,1,2 → 返回 attempt=3。"""
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            base = "YBCO_-45dBm_00mW_target_30K"
+            for suffix in ["_actual_29.995K.s2p",
+                           "_attempt1_actual_29.995K.s2p",
+                           "_attempt2_actual_29.995K.s2p"]:
+                with open(_os.path.join(tmpdir, base + suffix), "w") as f:
+                    f.write("dummy")
+            name = self._find_next(tmpdir, 30.0, -45, 0, 29.995)
+            assert "attempt3" in name
+
+    def test_given_different_actual_temp_when_finding_then_not_a_conflict(self):
+        """不同 actual K → 不视为冲突，返回 attempt=0。"""
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            existing = _os.path.join(
+                tmpdir,
+                "YBCO_-45dBm_00mW_target_30K_actual_30.500K.s2p")
+            with open(existing, "w") as f:
+                f.write("dummy")
+            name = self._find_next(tmpdir, 30.0, -45, 0, 29.995)
+            assert "attempt" not in name  # actual temp 不同，无冲突
