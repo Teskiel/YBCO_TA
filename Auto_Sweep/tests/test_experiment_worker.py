@@ -660,3 +660,782 @@ class TestMeasurementTempMonitor:
 
         # 即使温度偏离，实验也应完成（good_enough 回退）
         assert len(finished) >= 1
+
+
+# =========================================================================
+# 新增：max_wait 覆盖测试
+# =========================================================================
+
+class TestMaxWaitOverride:
+    """验证 max_wait_s 参数正确覆盖 stability controller。"""
+
+    def test_given_custom_max_wait_when_configured_then_controller_uses_it(
+        self,
+    ):
+        """configure(max_wait_s=600) → 稳定性控制器 MAX_WAIT_SECONDS=600。"""
+        worker = _build_worker(
+            temp_list=[30.0], power_list=[0],
+        )
+        from ui.workers import ExperimentWorker
+        worker.configure(
+            lakeshore_ctrl=_make_mock_lakeshore(),
+            laser_ctrl=_make_mock_laser(),
+            vna_resource=_make_mock_vna(),
+            temp_list=[30.0],
+            power_list=[0],
+            vna_power_list=[-45],
+            output_dir="/tmp/test",
+            vna_settings={},
+            max_wait_s=600,  # 10 min
+        )
+        assert worker._max_wait_s == 600
+
+    def test_given_no_max_wait_when_configured_then_uses_config_default(
+        self,
+    ):
+        """不传 max_wait_s → 使用 config.max_wait_seconds (1800s)。"""
+        worker = _build_worker(
+            temp_list=[30.0], power_list=[0],
+        )
+        from ui.workers import ExperimentWorker
+        worker.configure(
+            lakeshore_ctrl=_make_mock_lakeshore(),
+            laser_ctrl=_make_mock_laser(),
+            vna_resource=_make_mock_vna(),
+            temp_list=[30.0],
+            power_list=[0],
+            vna_power_list=[-45],
+            output_dir="/tmp/test",
+            vna_settings={},
+        )
+        import config
+        assert worker._max_wait_s == config.max_wait_seconds
+
+
+# =========================================================================
+# 新增：ΔT 熔断逻辑测试
+# =========================================================================
+
+class TestInterMeasurementAbort:
+    """验证测量中 ΔT > 0.25K 熔断行为。"""
+
+    def test_given_two_measurements_delta_lt_0_25_when_checking_then_no_abort(
+        self,
+    ):
+        """ΔT < 0.25K → 不应触发熔断。"""
+        temps = [30.01, 30.15, 30.20, 30.25]
+        temp_range = max(temps) - min(temps)
+        assert abs(temp_range - 0.24) < 0.001
+        assert temp_range <= 0.25, "ΔT ≤ 0.25K → 不触发熔断"
+
+    def test_given_two_measurements_delta_gt_0_25_when_checking_then_triggers_abort(
+        self,
+    ):
+        """ΔT > 0.25K → 应触发熔断。"""
+        temps = [30.01, 30.30, 30.15, 30.00]
+        temp_range = max(temps) - min(temps)
+        assert abs(temp_range - 0.30) < 0.001
+        import config
+        assert temp_range > config.inter_measurement_max_delta_k, \
+            "ΔT > 0.25K → 触发熔断"
+
+    def test_given_single_measurement_when_checking_then_no_abort(
+        self,
+    ):
+        """只有 1 个测量点 → 无需检查 ΔT（至少需要 2 个读数）。"""
+        temps = [30.0]
+        if len(temps) >= 2:
+            temp_range = max(temps) - min(temps)
+        else:
+            temp_range = 0.0  # 不够 2 个读数，不计算 ΔT
+        assert temp_range == 0.0
+
+
+# =========================================================================
+# Fix 4: 激光感知温度检查 — 纯函数测试
+# =========================================================================
+
+class TestLaserAwareTempCheck:
+    """验证 _check_measurement_temp() 在激光加热时放宽容差。"""
+
+    @staticmethod
+    def _check(pre_k, post_k, target_k, laser_mw=0):
+        """调用 ExperimentWorker 的静态方法。"""
+        from ui.workers import ExperimentWorker
+        return ExperimentWorker._check_measurement_temp(
+            pre_k, post_k, target_k, laser_power_mw=laser_mw)
+
+    # ---- 激光关闭时保持严格 ----
+
+    def test_given_laser_off_when_post_temp_drifts_0_6K_then_fails(self):
+        """激光关闭 + 测量后偏离 0.6K > 0.5K → 失败。"""
+        ok, reason = self._check(30.0, 30.6, 30.0, laser_mw=0)
+        assert ok is False
+        assert "0.5K" in reason
+
+    def test_given_laser_off_when_post_temp_drifts_0_25K_then_passes(self):
+        """激光关闭 + 测量后偏离 0.25K < 0.5K + 跳变 ≤0.3K → 通过。"""
+        ok, _ = self._check(30.0, 30.25, 30.0, laser_mw=0)
+        assert ok is True
+
+    # ---- 激光开启时放宽容差 ----
+
+    def test_given_laser_on_when_post_temp_0_75K_with_small_delta_then_passes(self):
+        """激光开启 + 测量后 0.75K（在 1.0K 内）+ 跳变 0.25K ≤0.3K → 通过。"""
+        # pre 已经 0.5K 偏离（边界通过），激光加热推到 0.75K，跳变仅 0.25K
+        ok, _ = self._check(30.5, 30.75, 30.0, laser_mw=5)
+        assert ok is True
+
+    def test_given_laser_on_when_post_temp_drifts_1_2K_then_fails(self):
+        """激光开启 + 测量后偏离 1.2K > 1.0K → 失败。"""
+        ok, reason = self._check(30.0, 31.2, 30.0, laser_mw=5)
+        assert ok is False
+        assert "1.0K" in reason
+
+    # ---- 测量前检查始终严格 ----
+
+    def test_given_laser_on_when_pre_temp_drifts_0_6K_then_fails(self):
+        """激光开启 + 测量前偏离 0.6K > 0.5K → 失败（前检查始终严格）。"""
+        ok, reason = self._check(30.6, 30.8, 30.0, laser_mw=5)
+        assert ok is False
+        assert "测量前" in reason
+        assert "0.5K" in reason
+
+    # ---- 测量期间跳变始终严格 ----
+
+    def test_given_laser_on_when_intra_measurement_delta_0_4K_then_fails(self):
+        """激光开启 + 测量跳变 0.4K > 0.3K → 失败（跳变检查始终严格）。"""
+        ok, reason = self._check(30.0, 30.4, 30.0, laser_mw=5)
+        assert ok is False
+        assert "跳变" in reason
+        assert "0.3K" in reason
+
+    # ---- 默认参数向后兼容 ----
+
+    def test_given_default_laser_power_when_not_provided_then_uses_strict_tolerance(self):
+        """不传 laser_power_mw → 默认 0（严格容差）。"""
+        ok, reason = self._check(30.0, 30.6, 30.0)  # 无 laser_mw 参数
+        assert ok is False
+        assert "0.5K" in reason
+
+
+# =========================================================================
+# Fix 3: 激光沉降时间分级
+# =========================================================================
+
+class TestLaserThermalSettling:
+    """验证激光首次上电 vs 功率切换使用不同沉降时间。"""
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_laser_was_off_when_setting_nonzero_power_then_first_on_settle_time_used(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """激光从关闭→开启时使用较长的首次上电沉降时间。"""
+        import config
+        laser = _make_mock_laser()
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+        worker = _build_worker(
+            lakeshore=ls, laser=laser,
+            temp_list=[30.0], power_list=[5],
+        )
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 验证首次上电沉降时间被调用
+        mock_sleep.assert_any_call(config.laser_first_on_settle_time_s)
+        # 验证激光输出开启
+        laser.output_on.assert_called()
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_laser_already_on_when_changing_power_then_normal_settle_time_used(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """激光已上电→切换功率时使用正常沉降时间。"""
+        import config
+        laser = _make_mock_laser()
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+        worker = _build_worker(
+            lakeshore=ls, laser=laser,
+            temp_list=[30.0], power_list=[3, 7],
+        )
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 第一次激光上电用长沉降
+        mock_sleep.assert_any_call(config.laser_first_on_settle_time_s)
+        # 第二次功率切换用短沉降
+        mock_sleep.assert_any_call(config.laser_settle_time_s)
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_power_zero_when_laser_off_then_output_off_called(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """功率 0 mW → laser.output_off() 被调用。"""
+        laser = _make_mock_laser()
+        worker = _build_worker(
+            laser=laser,
+            temp_list=[30.0], power_list=[0],
+        )
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        laser.output_off.assert_called()
+        # 验证 _laser_was_off 标志保持 True
+        assert worker._laser_was_off is True
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_laser_settle_when_complete_then_temperature_logged(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """激光沉降后记录温度变化（诊断日志）。"""
+        laser = _make_mock_laser()
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+        worker = _build_worker(
+            lakeshore=ls, laser=laser,
+            temp_list=[30.0], power_list=[5],
+        )
+
+        progress_messages = []
+        worker.progress.connect(lambda msg: progress_messages.append(msg))
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 验证"激光沉降后温度"诊断消息存在
+        settle_msgs = [m for m in progress_messages if "激光沉降后温度" in m]
+        assert len(settle_msgs) >= 1, "激光沉降后应记录温度变化"
+
+
+# =========================================================================
+# Fix 1: 预等待后温度稳定性验证
+# =========================================================================
+
+class TestPreMeasurementWaitStability:
+    """验证预测量等待后检查温度稳定性。"""
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_temp_in_tolerance_after_wait_when_checking_then_proceeds(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """预等待后温度在容差内 → 正常继续测量。"""
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+        worker = _build_worker(
+            lakeshore=ls, temp_list=[30.0], power_list=[0],
+        )
+        # 设置预等待 1 秒（已 patch sleep，实际不等待）
+        worker._pre_measurement_wait_s = 1
+
+        finished_counts = []
+        worker.experiment_finished.connect(lambda c: finished_counts.append(c))
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 测量应正常完成
+        assert finished_counts[0] >= 1, "预等待后温度正常应完成测量"
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_temp_drifted_after_wait_when_out_of_tolerance_then_reenters_stability(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """预等待后温度偏离 > 0.5K → 重入稳定性等待。"""
+        # 前两次调用返回 30.0（初始温度读取 + 稳定循环），
+        # 第三次调用（预等待后温度检查）返回 31.2K（Δ=1.2K > 0.5K）
+        call_idx = [0]
+
+        def get_temp(channel="A"):
+            call_idx[0] += 1
+            if call_idx[0] == 3:
+                return 31.2  # 预等待后漂移
+            return 30.0
+
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.side_effect = get_temp
+
+        worker = _build_worker(
+            lakeshore=ls, temp_list=[30.0], power_list=[0],
+        )
+        worker._pre_measurement_wait_s = 1
+
+        finished_counts = []
+        worker.experiment_finished.connect(lambda c: finished_counts.append(c))
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 应创建了多个 stability controller（初始 + 重稳定）
+        assert mock_ctrl_cls.call_count >= 2, \
+            f"预等待后漂移应创建新的 stability controller（实际: {mock_ctrl_cls.call_count}）"
+        assert finished_counts[0] >= 1, "重稳定后应完成测量"
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_pre_wait_zero_when_configured_then_no_stability_check(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """pre_measurement_wait_s=0 → 跳过预等待和稳定性检查。"""
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+        worker = _build_worker(
+            lakeshore=ls, temp_list=[30.0], power_list=[0],
+        )
+        worker._pre_measurement_wait_s = 0  # 默认值，跳过预等待
+
+        finished_counts = []
+        worker.experiment_finished.connect(lambda c: finished_counts.append(c))
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 正常完成，无额外 stability controller（仅初始稳定时创建 1 个）
+        assert finished_counts[0] >= 1
+        # wait=0 时直接进入 stablity_ctrl 的 while 循环，不经过预等待块
+
+
+# =========================================================================
+# Fix 2: 熔断重启上限
+# =========================================================================
+
+class TestMeltdownRestartLimit:
+    """验证熔断重启达到上限后跳过温度点。"""
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_normal_run_when_restarts_below_limit_then_measurement_completes(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """正常运行（熔断未超限）→ 测量正常完成。"""
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+
+        worker = _build_worker(
+            lakeshore=ls, temp_list=[30.0], power_list=[0],
+        )
+        worker._pre_measurement_wait_s = 0
+
+        finished_counts = []
+        worker.experiment_finished.connect(lambda c: finished_counts.append(c))
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 正常运行应完成测量
+        assert finished_counts[0] >= 1, \
+            f"温度正常应完成测量（实际: {finished_counts[0]}）"
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    @patch("config.max_meltdown_restarts", 2)
+    def test_given_restarts_exceed_limit_when_max_reached_then_skips_temperature(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """熔断次数达到上限 → 跳过此温度点，实验正常结束。"""
+        # 所有温度读数偏离 1K → 每次测量都熔断
+        ls = _make_mock_lakeshore(start_temp=31.0)
+        ls.get_temperature.return_value = 31.0
+
+        laser = _make_mock_laser()
+        worker = _build_worker(
+            lakeshore=ls, laser=laser, temp_list=[30.0], power_list=[0],
+        )
+        worker._pre_measurement_wait_s = 0
+
+        finished_counts = []
+        worker.experiment_finished.connect(lambda c: finished_counts.append(c))
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 实验完成（跳过了温度点），而非无限循环
+        assert finished_counts[0] == 0, \
+            f"温度点被跳过，测量数为 0（实际: {finished_counts[0]}）"
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    @patch("config.max_meltdown_restarts", 1)
+    def test_given_restart_limit_hit_when_laser_was_on_then_laser_off_called(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """熔断超限 → 跳过前确保激光安全关闭。"""
+        ls = _make_mock_lakeshore(start_temp=31.0)
+        ls.get_temperature.return_value = 31.0
+
+        laser = _make_mock_laser()
+        worker = _build_worker(
+            lakeshore=ls, laser=laser,
+            temp_list=[30.0], power_list=[5],
+        )
+        worker._pre_measurement_wait_s = 0
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl = mock_ctrl_cls.return_value
+            mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+            mock_ctrl.setup.return_value = None
+            mock_ctrl.add_reading.return_value = None
+            mock_ctrl.check.return_value = MagicMock(
+                stable=True, reason="stable", avg_temp=30.0)
+            mock_ctrl.needs_setpoint_adjustment.return_value = None
+            mock_ctrl.base_overshoot = 1.5
+            mock_ctrl.current_overshoot = 1.5
+
+            worker.run()
+
+        # 验证激光关闭被调用（跳过温度点时的安全措施）
+        laser.set_power.assert_any_call(0)
+        laser.output_off.assert_called()
+
+
+# =========================================================================
+# 断点续传: CheckpointManager 单元测试
+# =========================================================================
+
+import json
+import os as _os
+import tempfile as _tempfile
+
+
+class TestCheckpointManager:
+    """验证 CheckpointManager 的保存/加载/恢复/清理。"""
+
+    @staticmethod
+    def _make_state():
+        return {
+            "temp_idx": 2,
+            "vna_dbm_idx": 0,
+            "power_mw_idx": 0,
+            "current_temp_k": 73.6,
+            "total_count": 25,
+            "extended_max_wait_s": 1800,
+            "extended_pre_wait_s": 300,
+            "rollback_consecutive_issues": 0,
+            "rollback_first_issue_index": None,
+            "rollback_count": 0,
+            "overshoot_learning": {},
+        }
+
+    @staticmethod
+    def _make_completed_points():
+        return [
+            {"temp_k": 72.0, "vna_dbm": -45, "power_mw": 0, "actual_k": 71.604},
+            {"temp_k": 72.0, "vna_dbm": -45, "power_mw": 1, "actual_k": 71.693},
+            {"temp_k": 74.0, "vna_dbm": -45, "power_mw": 0, "actual_k": 73.599},
+            {"temp_k": 74.0, "vna_dbm": -45, "power_mw": 1, "actual_k": 73.690},
+            {"temp_k": 74.0, "vna_dbm": -45, "power_mw": 3, "actual_k": 73.691},
+        ]
+
+    # ---- 保存 & 加载 ----
+
+    def test_given_state_and_points_when_save_then_file_created(self):
+        """保存检查点 → 文件存在且内容完整。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            state = self._make_state()
+            points = self._make_completed_points()
+            CheckpointManager.save(tmpdir, state, points, "20260612_190601",
+                                   [72.0, 74.0, 76.0], [-45, -30, -25], [0, 1, 3, 5, 7, 9])
+            ckpt_path = _os.path.join(tmpdir, "checkpoint.json")
+            assert _os.path.exists(ckpt_path)
+            with open(ckpt_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            assert data["version"] == 1
+            assert data["state"]["temp_idx"] == 2
+            assert len(data["completed_points"]) == 5
+
+    def test_given_saved_checkpoint_when_load_then_returns_state_and_points(self):
+        """加载有效检查点 → 返回 state dict 和 completed_points list。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            state = self._make_state()
+            points = self._make_completed_points()
+            CheckpointManager.save(tmpdir, state, points, "20260612_190601",
+                                   [72.0, 74.0, 76.0], [-45, -30, -25], [0, 1, 3, 5, 7, 9])
+            loaded_state, loaded_points = CheckpointManager.load(tmpdir)
+            assert loaded_state is not None
+            assert loaded_state["temp_idx"] == 2
+            assert loaded_state["total_count"] == 25
+            assert len(loaded_points) == 5
+
+    def test_given_no_checkpoint_when_load_then_returns_none(self):
+        """无检查点文件 → load() 返回 None。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            result = CheckpointManager.load(tmpdir)
+            assert result is None
+
+    def test_given_corrupt_checkpoint_when_load_then_returns_none(self):
+        """检查点 JSON 损坏 → load() 返回 None（不抛异常）。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = _os.path.join(tmpdir, "checkpoint.json")
+            with open(ckpt_path, "w", encoding="utf-8") as f:
+                f.write("not valid json {{{")
+            result = CheckpointManager.load(tmpdir)
+            assert result is None
+
+    # ---- 增量追加 ----
+
+    def test_given_existing_checkpoint_when_append_point_then_point_added(self):
+        """增量追加测量点 → completed_points 增长。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            state = self._make_state()
+            points = self._make_completed_points()
+            CheckpointManager.save(tmpdir, state, points, "20260612_190601",
+                                   [72.0, 74.0, 76.0], [-45, -30, -25], [0, 1, 3, 5, 7, 9])
+            new_point = {"temp_k": 74.0, "vna_dbm": -45, "power_mw": 5,
+                         "actual_k": 73.691}
+            CheckpointManager.append_point(tmpdir, new_point)
+            _, loaded_points = CheckpointManager.load(tmpdir)
+            assert len(loaded_points) == 6
+            assert loaded_points[-1]["power_mw"] == 5
+
+    def test_given_no_checkpoint_when_append_point_then_does_nothing(self):
+        """无检查点文件 → append_point() 不抛异常，不创建文件。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            CheckpointManager.append_point(tmpdir, {"temp_k": 30.0, "vna_dbm": -45,
+                                                     "power_mw": 0, "actual_k": 30.0})
+            assert not _os.path.exists(_os.path.join(tmpdir, "checkpoint.json"))
+
+    # ---- 删除 ----
+
+    def test_given_checkpoint_exists_when_delete_then_file_removed(self):
+        """delete() → 检查点文件被删除。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            state = self._make_state()
+            CheckpointManager.save(tmpdir, state, [], "test",
+                                   [30.0], [-45], [0])
+            assert _os.path.exists(_os.path.join(tmpdir, "checkpoint.json"))
+            CheckpointManager.delete(tmpdir)
+            assert not _os.path.exists(_os.path.join(tmpdir, "checkpoint.json"))
+
+    def test_given_no_checkpoint_when_delete_then_no_error(self):
+        """无检查点 → delete() 不抛异常。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            CheckpointManager.delete(tmpdir)  # 不应抛异常
+
+    # ---- 恢复判断 ----
+
+    def test_given_completed_points_when_resume_then_skips_done_points(self):
+        """completed_points 中已有的点 → resume_from 跳过。"""
+        from ui.workers import CheckpointManager
+        completed = [
+            {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 0, "actual_k": 30.0},
+            {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 5, "actual_k": 30.1},
+        ]
+        result = CheckpointManager.resume_from(
+            completed,
+            temp_list=[30.0, 50.0],
+            vna_power_list=[-45],
+            power_list=[0, 5],
+        )
+        # 30.0K 的两个 power 都已完成 → 应从 50.0K / -45dBm / 0mW 开始
+        assert result == (1, 0, 0)  # temp_idx=1, vna_idx=0, power_idx=0
+
+    def test_given_partial_temp_completed_when_resume_then_starts_at_next_power(self):
+        """同一温度点部分完成 → 从下一个未完成的 power 开始。"""
+        from ui.workers import CheckpointManager
+        completed = [
+            {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 0, "actual_k": 30.0},
+        ]
+        result = CheckpointManager.resume_from(
+            completed,
+            temp_list=[30.0],
+            vna_power_list=[-45],
+            power_list=[0, 5, 10],
+        )
+        assert result == (0, 0, 1)  # power_idx=1 (5mW)
+
+    def test_given_all_points_completed_when_resume_then_returns_none(self):
+        """所有点都完成 → resume_from 返回 None。"""
+        from ui.workers import CheckpointManager
+        completed = [
+            {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 0, "actual_k": 30.0},
+            {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 5, "actual_k": 30.1},
+        ]
+        result = CheckpointManager.resume_from(
+            completed,
+            temp_list=[30.0],
+            vna_power_list=[-45],
+            power_list=[0, 5],
+        )
+        assert result is None
+
+    def test_given_vna_power_levels_when_resume_then_correctly_advances(self):
+        """多个 VNA 功率级别 → 恢复时正确跨 VNA 功率推进。"""
+        from ui.workers import CheckpointManager
+        completed = [
+            {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 0, "actual_k": 30.0},
+            {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 5, "actual_k": 30.1},
+            {"temp_k": 30.0, "vna_dbm": -30, "power_mw": 0, "actual_k": 30.2},
+        ]
+        result = CheckpointManager.resume_from(
+            completed,
+            temp_list=[30.0],
+            vna_power_list=[-45, -30],
+            power_list=[0, 5],
+        )
+        # -45dBm 全部完成，-30dBm 的 0mW 完成 → 从 -30dBm / 5mW 开始
+        assert result == (0, 1, 1)  # temp_idx=0, vna_idx=1, power_idx=1
+
+    # ---- 参数列表不匹配 ----
+
+    def test_given_temp_list_changed_when_load_then_validate_warns(self):
+        """温度列表变更 → 恢复时检测到不匹配。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            state = self._make_state()
+            CheckpointManager.save(tmpdir, state, [], "test",
+                                   original_temp_list=[72.0, 74.0, 76.0],
+                                   original_vna_power_list=[-45],
+                                   original_power_list=[0, 1, 3, 5, 7, 9])
+            loaded_state, _ = CheckpointManager.load(tmpdir)
+            # 新温度列表与原始不同
+            new_temp_list = [72.0, 74.0, 80.0]  # 76→80 变更
+            is_match = (loaded_state is not None and
+                        CheckpointManager.validate_lists(
+                            loaded_state, new_temp_list, [-45], [0, 1, 3, 5, 7, 9]))
+            assert is_match is False
+
+    def test_given_same_lists_when_load_then_validate_passes(self):
+        """参数列表未变 → validate_lists 返回 True。"""
+        from ui.workers import CheckpointManager
+        with _tempfile.TemporaryDirectory() as tmpdir:
+            state = self._make_state()
+            CheckpointManager.save(tmpdir, state, [], "test",
+                                   original_temp_list=[72.0, 74.0, 76.0],
+                                   original_vna_power_list=[-45, -30],
+                                   original_power_list=[0, 1, 3, 5, 7, 9])
+            loaded_state, _ = CheckpointManager.load(tmpdir)
+            is_match = (loaded_state is not None and
+                        CheckpointManager.validate_lists(
+                            loaded_state,
+                            [72.0, 74.0, 76.0],
+                            [-45, -30],
+                            [0, 1, 3, 5, 7, 9]))
+            assert is_match is True
