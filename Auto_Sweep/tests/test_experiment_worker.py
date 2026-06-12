@@ -1537,3 +1537,167 @@ class TestS2PFilenameDedup:
                 f.write("dummy")
             name = self._find_next(tmpdir, 30.0, -45, 0, 29.995)
             assert "attempt" not in name  # actual temp 不同，无冲突
+
+
+# =========================================================================
+# 断点续传: 恢复流程集成测试
+# =========================================================================
+
+class TestExperimentRecovery:
+    """验证 ExperimentWorker 的恢复信号和工作流。"""
+
+    def test_given_worker_configured_when_signals_exist_then_accessible(self):
+        """新信号应在 ExperimentWorker 上可连接。"""
+        from ui.workers import ExperimentWorker
+        worker = ExperimentWorker()
+        # 确认信号存在
+        assert hasattr(worker, "experiment_recovering")
+        assert hasattr(worker, "experiment_recovered")
+        assert hasattr(worker, "experiment_recovery_timeout")
+        assert hasattr(worker, "experiment_resume_prompt")
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_connection_lost_during_run_when_recoverable_then_checkpoint_saved(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """连接丢失 → 检查点文件被写入。"""
+        import tempfile
+        from ui.workers import CheckpointManager
+
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                lakeshore=ls, temp_list=[30.0, 50.0], power_list=[0],
+                output_dir=tmpdir,
+            )
+
+            # 第一次 get_temperature 成功，后续抛出连接错误
+            call_count = [0]
+
+            def get_temp_with_failure(channel="A"):
+                call_count[0] += 1
+                if call_count[0] >= 3:
+                    raise Exception("VI_ERROR_CONN_LOST (-1073807194): "
+                                    "The connection for the given session has been lost.")
+                return 30.0
+
+            ls.get_temperature.side_effect = get_temp_with_failure
+
+            errors = []
+            worker.experiment_error.connect(lambda e: errors.append(e))
+            recovering = []
+            worker.experiment_recovering.connect(lambda msg: recovering.append(msg))
+
+            with patch(
+                "ui.experiment_stability_controller.ExperimentStabilityController"
+            ) as mock_ctrl_cls:
+                mock_ctrl = mock_ctrl_cls.return_value
+                mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+                mock_ctrl.setup.return_value = None
+                mock_ctrl.add_reading.return_value = None
+                mock_ctrl.check.return_value = MagicMock(
+                    stable=True, reason="stable", avg_temp=30.0)
+                mock_ctrl.needs_setpoint_adjustment.return_value = None
+                mock_ctrl.base_overshoot = 1.5
+                mock_ctrl.current_overshoot = 1.5
+
+                worker.run()
+
+            # 不应发射 experiment_error（这是可恢复错误）
+            assert len(errors) == 0
+            # 应发射 experiment_recovering
+            assert len(recovering) == 1
+            # 检查点应存在
+            ckpt = CheckpointManager.load(tmpdir)
+            assert ckpt is not None
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_recoverable_error_when_not_connection_then_error_emitted(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """不可恢复的错误 → experiment_error 正常发射。"""
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+
+        worker = _build_worker(
+            lakeshore=ls, temp_list=[30.0], power_list=[0],
+        )
+
+        # 让 stability controller 抛出非连接错误
+        errors = []
+        worker.experiment_error.connect(lambda e: errors.append(e))
+
+        with patch(
+            "ui.experiment_stability_controller.ExperimentStabilityController"
+        ) as mock_ctrl_cls:
+            mock_ctrl_cls.side_effect = ValueError("invalid config value")
+
+            worker.run()
+
+        # 不可恢复的异常应被捕获并发射
+        assert len(errors) == 1
+        assert "invalid config value" in errors[0]
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_checkpoint_exists_when_run_starts_then_resume_prompt_emitted(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """启动时检测到检查点 → 发射 experiment_resume_prompt。"""
+        import tempfile
+        from ui.workers import CheckpointManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 预置检查点
+            state = {
+                "temp_idx": 0, "vna_dbm_idx": 0, "power_mw_idx": 1,
+                "current_temp_k": 30.0, "total_count": 1,
+                "extended_max_wait_s": 1800, "extended_pre_wait_s": 0,
+                "rollback_consecutive_issues": 0,
+                "rollback_first_issue_index": None,
+                "rollback_count": 0,
+                "overshoot_learning": {},
+            }
+            completed = [
+                {"temp_k": 30.0, "vna_dbm": -45, "power_mw": 0, "actual_k": 30.0},
+            ]
+            CheckpointManager.save(
+                tmpdir, state, completed, "20260612_test",
+                original_temp_list=[30.0, 50.0],
+                original_vna_power_list=[-45],
+                original_power_list=[0, 5],
+            )
+
+            ls = _make_mock_lakeshore(start_temp=30.0)
+            ls.get_temperature.return_value = 30.0
+            worker = _build_worker(
+                lakeshore=ls, temp_list=[30.0, 50.0], power_list=[0, 5],
+                output_dir=tmpdir,
+            )
+
+            resume_prompts = []
+            worker.experiment_resume_prompt.connect(
+                lambda exp_id, n: resume_prompts.append((exp_id, n)))
+
+            with patch(
+                "ui.experiment_stability_controller.ExperimentStabilityController"
+            ) as mock_ctrl_cls:
+                mock_ctrl = mock_ctrl_cls.return_value
+                mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+                mock_ctrl.setup.return_value = None
+                mock_ctrl.add_reading.return_value = None
+                mock_ctrl.check.return_value = MagicMock(
+                    stable=True, reason="stable", avg_temp=30.0)
+                mock_ctrl.needs_setpoint_adjustment.return_value = None
+                mock_ctrl.base_overshoot = 1.5
+                mock_ctrl.current_overshoot = 1.5
+
+                worker.run()
+
+            assert len(resume_prompts) == 1
+            assert resume_prompts[0][0] == "20260612_test"
+            assert resume_prompts[0][1] == 1  # 1 completed point
