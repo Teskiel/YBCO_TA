@@ -14,6 +14,10 @@ from typing import Optional
 
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 
+from memory_monitor import MemoryMonitor
+
+import gc as _gc  # 实验结束后强制回收循环引用
+
 
 # ---------------------------------------------------------------------------
 # Data containers
@@ -35,6 +39,122 @@ class LakeShoreReading:
     pid_p2: Optional[float] = None
     pid_i2: Optional[float] = None
     pid_d2: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# 超时软化 + 连续回退状态机（需求 A/B/C）
+# ---------------------------------------------------------------------------
+
+class TimeoutRollbackState:
+    """追踪连续温度点稳定性问题，决策何时回退。
+
+    需求 A: 超时后 |avg−target| ≤ soft_pass_band_k → "soft_pass"，否则 "hard_fail"
+    需求 B: 连续 N 次问题 → 回退到第一个问题温度点，加时重试
+    需求 C: 4K 目标跳过温度范围检定
+
+    Attributes:
+        temp_list: 温度点列表 (K)
+        soft_pass_band_k: 超时软通过带 (K)
+        consecutive_threshold: 连续问题阈值
+        skip_validation_temp_k: 跳过检定的特殊温度 (K)
+        rollback_max_wait_increase_s: 每次回退 max_wait 增量 (秒)
+        rollback_pre_wait_increase_s: 每次回退 pre_wait 增量 (秒)
+        consecutive_issues: 当前连续问题计数
+        first_issue_index: 第一个问题温度在 temp_list 中的索引
+        rollback_count: 已回退次数
+        current_max_wait_increase_s: 累积 max_wait 增量
+        current_pre_wait_increase_s: 累积 pre_wait 增量
+    """
+
+    def __init__(self, temp_list, *,
+                 soft_pass_band_k=2.0,
+                 consecutive_threshold=2,
+                 skip_validation_temp_k=4.0,
+                 rollback_max_wait_increase_s=1800,
+                 rollback_pre_wait_increase_s=600):
+        self.temp_list = list(temp_list)
+        self.soft_pass_band_k = soft_pass_band_k
+        self.consecutive_threshold = consecutive_threshold
+        self.skip_validation_temp_k = skip_validation_temp_k
+        self.rollback_max_wait_increase_s = rollback_max_wait_increase_s
+        self.rollback_pre_wait_increase_s = rollback_pre_wait_increase_s
+
+        # 运行时状态
+        self.consecutive_issues = 0
+        self.first_issue_index = None
+        self.rollback_count = 0
+        self.current_max_wait_increase_s = 0
+        self.current_pre_wait_increase_s = 0
+
+    # ---- 需求 A: 超时分类 ----
+
+    def classify_timeout(self, avg_temp, target_k):
+        """将超时结果分类为 'soft_pass' 或 'hard_fail'。
+
+        需求 A: |avg−target| ≤ band → soft_pass，否则 hard_fail。
+        需求 C: 4K 目标始终视为 soft_pass（液氦制冷达不到精确 4K）。
+        """
+        # 4K 豁免：始终软通过
+        if self.is_skip_validation_temp(target_k):
+            return "soft_pass"
+
+        delta = abs(avg_temp - target_k)
+        if delta <= self.soft_pass_band_k:
+            return "soft_pass"
+        return "hard_fail"
+
+    # ---- 需求 B: 连续追踪与回退决策 ----
+
+    def record_result(self, temp_index, result_type):
+        """记录一个温度点的稳定性结果。
+
+        Args:
+            temp_index: 当前温度在 temp_list 中的索引
+            result_type: "stable" | "good_enough" | "soft_pass" | "hard_fail" | "meltdown_skip"
+
+        Returns:
+            (should_rollback: bool, first_issue_index: int or None)
+        """
+        is_issue = result_type in ("soft_pass", "hard_fail", "meltdown_skip")
+
+        if is_issue:
+            if self.consecutive_issues == 0:
+                # 新问题链开始
+                self.first_issue_index = temp_index
+            self.consecutive_issues += 1
+
+            if self.consecutive_issues >= self.consecutive_threshold:
+                # 触发回退
+                self.rollback_count += 1
+                self.current_max_wait_increase_s += self.rollback_max_wait_increase_s
+                self.current_pre_wait_increase_s += self.rollback_pre_wait_increase_s
+                first = self.first_issue_index
+                return True, first
+        else:
+            # 正常稳定 → 重置
+            self.consecutive_issues = 0
+            self.first_issue_index = None
+
+        return False, None
+
+    def reset_after_rollback(self):
+        """回退后重置连续计数（保留累加时间）。"""
+        self.consecutive_issues = 0
+        self.first_issue_index = None
+
+    def get_rollback_params(self):
+        """获取回退参数: (max_wait_increase_s, pre_wait_increase_s)。"""
+        return (self.current_max_wait_increase_s,
+                self.current_pre_wait_increase_s)
+
+    # ---- 需求 C: 4K 豁免 ----
+
+    def is_skip_validation_temp(self, target_k):
+        """检查目标温度是否为应跳过检定的特殊温度（4K）。
+
+        使用浮点容差 0.1K 判断。
+        """
+        return abs(target_k - self.skip_validation_temp_k) < 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -358,11 +478,18 @@ class VNAWorker(QObject):
 
         Keys: start_freq_hz, stop_freq_hz, s_parameter, power_dbm,
               points, if_bandwidth_hz
+
+        Sends :ABORt and :INIT:CONT OFF first to avoid blocking
+        when VNA is in continuous sweep mode.
         """
         if not self._vna:
             self.error.emit("VNA not connected")
             return
         try:
+            # ---- 安全前置：停止扫描，避免后续命令阻塞 ----
+            self._vna.write(":ABORt")
+            self._vna.write(":INITiate:CONTinuous OFF")
+
             # frequency range — set start then stop
             if "start_freq_hz" in settings:
                 self._vna.write(f":SENSe:FREQuency:STARt {settings['start_freq_hz']:.0f}")
@@ -390,6 +517,11 @@ class VNAWorker(QObject):
             # IF bandwidth
             if "if_bandwidth_hz" in settings:
                 self._vna.write(f":SENSe:BANDwidth {settings['if_bandwidth_hz']}")
+
+            # ---- 恢复连续扫描，使 VNA 屏幕显示 S 参数曲线 ----
+            # :ABORt + :INIT:CONT OFF 确保了参数写入时不阻塞，
+            # 写入完成后重新开启连续模式恢复实时曲线显示。
+            self._vna.write(":INITiate:CONTinuous ON")
 
             self.settings_applied.emit(settings)
             self.log.emit(f"VNA settings applied: "
@@ -430,6 +562,215 @@ class VNAWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# CheckpointManager — 实验断点续传
+# ---------------------------------------------------------------------------
+
+class CheckpointManager:
+    """检查点文件的原子读写与恢复判断。
+
+    检查点保存到实验输出目录的 ``checkpoint.json``。
+    写入使用 .tmp + os.rename 保证原子性，崩溃不会产生损坏文件。
+
+    所有方法均为静态方法，无状态 — 可被 ExperimentWorker 直接调用。
+    """
+
+    CHECKPOINT_VERSION = 1
+    CHECKPOINT_FILENAME = "checkpoint.json"
+
+    # ---- 保存 & 加载 ----
+
+    @staticmethod
+    def save(output_dir: str, state: dict, completed_points: list,
+             experiment_id: str,
+             original_temp_list: list, original_vna_power_list: list,
+             original_power_list: list) -> None:
+        """原子写入检查点文件。
+
+        Args:
+            output_dir: 实验输出根目录
+            state: 当前运行状态字典 (temp_idx, overshoot_learning, 等)
+            completed_points: 已完成测量点列表
+            experiment_id: 实验标识 (YYYYMMDD_HHMMSS)
+            original_temp_list: 实验开始时的温度列表（用于恢复验证）
+            original_vna_power_list: 实验开始时的 VNA 功率列表
+            original_power_list: 实验开始时的激光功率列表
+        """
+        import json as _json
+        import os as _os
+        import time as _time
+
+        # 将原始列表注入 state，使 validate_lists 可通过 load() 返回值访问
+        state = dict(state)
+        state["original_temp_list"] = list(original_temp_list)
+        state["original_vna_power_list"] = list(original_vna_power_list)
+        state["original_power_list"] = list(original_power_list)
+
+        checkpoint = {
+            "version": CheckpointManager.CHECKPOINT_VERSION,
+            "experiment_id": experiment_id,
+            "timestamp": _time.strftime(
+                "%Y-%m-%dT%H:%M:%S", _time.localtime(_time.time())),
+            "original_temp_list": list(original_temp_list),
+            "original_vna_power_list": list(original_vna_power_list),
+            "original_power_list": list(original_power_list),
+            "state": state,
+            "completed_points": completed_points,
+        }
+
+        ckpt_path = _os.path.join(output_dir, CheckpointManager.CHECKPOINT_FILENAME)
+        tmp_path = ckpt_path + ".tmp"
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            _json.dump(checkpoint, f, indent=2, ensure_ascii=False)
+
+        # 原子 rename（Windows 上如果目标存在会先删除）
+        _os.replace(tmp_path, ckpt_path)
+
+    @staticmethod
+    def load(output_dir: str):
+        """加载检查点文件。
+
+        Returns:
+            (state_dict, completed_points_list) 或 None（文件不存在/损坏）
+        """
+        import json as _json
+        import os as _os
+
+        ckpt_path = _os.path.join(output_dir, CheckpointManager.CHECKPOINT_FILENAME)
+        if not _os.path.exists(ckpt_path):
+            return None
+
+        # 也检查 .tmp 残留（上次写入崩溃）
+        tmp_path = ckpt_path + ".tmp"
+        if _os.path.exists(tmp_path):
+            # .tmp 存在但 .json 也存在 → 上次 rename 可能失败
+            # 如果 .json 更新时间 >= .tmp 更新时间 → 使用 .json
+            # 否则忽略 .tmp（不完整写入）
+            pass  # .json 存在即可，忽略 .tmp
+
+        try:
+            with open(ckpt_path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except (_json.JSONDecodeError, OSError, IOError):
+            return None
+
+        # 基本结构验证
+        if not isinstance(data, dict):
+            return None
+        if "state" not in data or "completed_points" not in data:
+            return None
+
+        return (data["state"], data["completed_points"])
+
+    @staticmethod
+    def append_point(output_dir: str, point: dict) -> None:
+        """增量追加一个已完成测量点到检查点文件。
+
+        如果检查点不存在，不执行任何操作（非致命）。
+        """
+        import json as _json
+        import os as _os
+        import time as _time
+
+        ckpt_path = _os.path.join(output_dir, CheckpointManager.CHECKPOINT_FILENAME)
+        if not _os.path.exists(ckpt_path):
+            return
+
+        tmp_path = ckpt_path + ".tmp"
+        try:
+            with open(ckpt_path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except (_json.JSONDecodeError, OSError, IOError):
+            return
+
+        data.setdefault("completed_points", []).append(point)
+        data["timestamp"] = _time.strftime(
+            "%Y-%m-%dT%H:%M:%S", _time.localtime(_time.time()))
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2, ensure_ascii=False)
+        _os.replace(tmp_path, ckpt_path)
+
+    @staticmethod
+    def delete(output_dir: str) -> None:
+        """删除检查点文件（实验正常完成时调用）。"""
+        import os as _os
+        ckpt_path = _os.path.join(output_dir, CheckpointManager.CHECKPOINT_FILENAME)
+        tmp_path = ckpt_path + ".tmp"
+        for path in (ckpt_path, tmp_path):
+            if _os.path.exists(path):
+                try:
+                    _os.remove(path)
+                except OSError:
+                    pass
+
+    # ---- 恢复判断 ----
+
+    @staticmethod
+    def resume_from(completed_points: list, temp_list: list,
+                    vna_power_list: list, power_list: list):
+        """根据已完成测量点确定恢复起点。
+
+        completed_points 是权威数据源 — 扫描所有 (temp, vna, power)
+        组合，返回第一个未完成点的索引。
+
+        Args:
+            completed_points: 已完成测量点列表
+            temp_list: 温度列表
+            vna_power_list: VNA 功率列表
+            power_list: 激光功率列表
+
+        Returns:
+            (temp_idx, vna_idx, power_idx) 或 None（全部完成）
+        """
+        # 构建已完成集合: {(temp_k, vna_dbm, power_mw), ...}
+        done = set()
+        for pt in completed_points:
+            done.add((
+                pt.get("temp_k"),
+                pt.get("vna_dbm"),
+                pt.get("power_mw"),
+            ))
+
+        for ti, temp_k in enumerate(temp_list):
+            for vi, vna_dbm in enumerate(vna_power_list):
+                for pi, power_mw in enumerate(power_list):
+                    if (temp_k, vna_dbm, power_mw) not in done:
+                        return (ti, vi, pi)
+
+        return None  # 全部完成
+
+    # ---- 参数验证 ----
+
+    @staticmethod
+    def validate_lists(loaded_state: dict, current_temp_list: list,
+                       current_vna_power_list: list,
+                       current_power_list: list) -> bool:
+        """检查当前参数列表是否与保存时一致。
+
+        Args:
+            loaded_state: load() 返回的 state 字典（含 original_temp_list 等）
+            current_temp_list: 当前配置的温度列表
+            current_vna_power_list: 当前配置的 VNA 功率列表
+            current_power_list: 当前配置的激光功率列表
+
+        Returns:
+            True 如果一致，False 如果有变更
+        """
+        orig_temp = loaded_state.get("original_temp_list")
+        orig_vna = loaded_state.get("original_vna_power_list")
+        orig_power = loaded_state.get("original_power_list")
+
+        if orig_temp is None or orig_vna is None or orig_power is None:
+            # 旧版本检查点可能没有这些字段 → 保守拒绝
+            return False
+
+        return (list(orig_temp) == list(current_temp_list) and
+                list(orig_vna) == list(current_vna_power_list) and
+                list(orig_power) == list(current_power_list))
+
+
+# ---------------------------------------------------------------------------
 # ExperimentWorker — full YBCO temperature + laser power sweep
 # ---------------------------------------------------------------------------
 
@@ -451,6 +792,7 @@ class ExperimentWorker(QObject):
     experiment_finished = pyqtSignal(int)                     # total count
     experiment_error = pyqtSignal(str)
     experiment_aborted = pyqtSignal()
+    memory_critical = pyqtSignal(str)                        # 内存严重不足弹窗告警
 
     def __init__(self):
         super().__init__()
@@ -475,6 +817,8 @@ class ExperimentWorker(QObject):
         vna_power_list=None,
         output_dir="",
         vna_settings=None,
+        pre_measurement_wait_s=0,
+        max_wait_s=None,
     ):
         self._lakeshore_ctrl = lakeshore_ctrl
         self._laser_ctrl = laser_ctrl
@@ -485,6 +829,10 @@ class ExperimentWorker(QObject):
         self._output_dir = output_dir
         self._vna_settings = dict(vna_settings or {})
         self._abort_flag = False
+        self._pre_measurement_wait_s = pre_measurement_wait_s
+        self._laser_was_off = True   # Fix 3: 初始状态激光关闭
+        import config
+        self._max_wait_s = max_wait_s if max_wait_s is not None else config.max_wait_seconds
 
     @pyqtSlot()
     def abort(self):
@@ -536,30 +884,37 @@ class ExperimentWorker(QObject):
 
     @staticmethod
     def _check_measurement_temp(pre_k: float, post_k: float,
-                                 target_k: float) -> tuple:
+                                 target_k: float,
+                                 laser_power_mw: float = 0) -> tuple:
         """检查测量前后的温度是否满足稳态条件。
 
         Args:
             pre_k: 测量前实际温度 (K)
             post_k: 测量后实际温度 (K)
             target_k: 目标温度 (K)
+            laser_power_mw: 当前激光功率 (mW)，>0 时放宽测量后容差
 
         Returns:
             (ok: bool, reason: str)
         """
-        # 测量前温度偏离 > ±0.5K
+        import config
+
+        # 测量前温度偏离 > ±0.5K（始终严格 — 测量前激光尚未加热样品）
         if abs(pre_k - target_k) > 0.5:
             return (False,
                     f"测量前温度偏离: {pre_k:.3f}K vs target {target_k:.1f}K "
                     f"(Δ={abs(pre_k-target_k):.3f}K > 0.5K)")
 
-        # 测量后温度偏离 > ±0.5K
-        if abs(post_k - target_k) > 0.5:
+        # 测量后温度偏离 — 激光加热时放宽容差
+        post_tolerance = (config.laser_on_temp_tolerance_k
+                          if laser_power_mw > 0 else 0.5)
+        if abs(post_k - target_k) > post_tolerance:
             return (False,
                     f"测量后温度偏离: {post_k:.3f}K vs target {target_k:.1f}K "
-                    f"(Δ={abs(post_k-target_k):.3f}K > 0.5K)")
+                    f"(Δ={abs(post_k-target_k):.3f}K > {post_tolerance}K"
+                    f"{' (激光加热放宽)' if laser_power_mw > 0 else ''})")
 
-        # 测量期间温度跳变 > 0.3K
+        # 测量期间温度跳变 > 0.3K（始终严格）
         delta = abs(post_k - pre_k)
         if delta > 0.3:
             return (False,
@@ -583,6 +938,18 @@ class ExperimentWorker(QObject):
             self.experiment_started.emit()
             count = 0
             start_time = datetime.now()
+
+            # ---- 初始化内存监控 ----
+            mem_monitor = None
+            mem_check_interval = getattr(config, "memory_check_interval_s", 60)
+            if getattr(config, "memory_monitor_enabled", True):
+                mem_monitor = MemoryMonitor(
+                    warning_threshold_mb=getattr(
+                        config, "memory_warning_threshold_mb", 8192),
+                    critical_threshold_mb=getattr(
+                        config, "memory_critical_threshold_mb", 4096),
+                    log_callback=lambda msg: self.progress.emit(msg),
+                )
 
             # ---- 创建日志目录并打开日志文件 ----
             log_dir = os.path.join(self._output_dir, "logs")
@@ -616,13 +983,65 @@ class ExperimentWorker(QObject):
             _log(f"激光功率列表: {self._power_list} mW")
             _log(f"VNA 功率列表: {self._vna_power_list} dBm")
 
-            for target_k in self._temp_list:
+            # ---- 初始内存状态 + 进程诊断 ----
+            if mem_monitor:
+                info = mem_monitor.check()
+                _log(f"内存监控启用 | {mem_monitor.format_info(info)}")
+                _log(f"  告警阈值: <{mem_monitor.warning_threshold_mb:.0f}MB, "
+                     f"严重阈值: <{mem_monitor.critical_threshold_mb:.0f}MB")
+                if getattr(config, "memory_process_diag_enabled", True):
+                    from memory_monitor import get_top_processes
+                    _log(get_top_processes())
+
+            # ---- 超时软化 + 连续回退状态机（需求 A/B/C） ----
+            _rollback_state = TimeoutRollbackState(
+                temp_list=self._temp_list,
+                soft_pass_band_k=getattr(config, "timeout_soft_pass_band_k", 2.0),
+                consecutive_threshold=getattr(config, "consecutive_issue_threshold", 2),
+                skip_validation_temp_k=getattr(config, "skip_validation_temp_k", 4.0),
+                rollback_max_wait_increase_s=(
+                    getattr(config, "rollback_max_wait_increase_min", 30) * 60),
+                rollback_pre_wait_increase_s=(
+                    getattr(config, "rollback_pre_wait_increase_min", 10) * 60),
+            )
+            _extended_max_wait_s = self._max_wait_s
+            _extended_pre_wait_s = self._pre_measurement_wait_s
+
+            # ---- 加载 overshoot 学习历史（跨实验持久化） ----
+            _overshoot_learning = {}
+            try:
+                import json as _json
+                _settings_path = os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "app_settings.json")
+                if os.path.exists(_settings_path):
+                    with open(_settings_path, "r", encoding="utf-8") as _f:
+                        _settings = _json.load(_f)
+                    _raw = _settings.get("overshoot_learning", {})
+                    _overshoot_learning = {
+                        float(k): float(v) for k, v in _raw.items()}
+                    if _overshoot_learning:
+                        _log(f"已加载 overshoot 学习数据: "
+                             f"{len(_overshoot_learning)} 个温度点")
+            except Exception:
+                pass  # 首次运行或无学习数据，使用默认值
+
+            temp_idx = 0
+            while temp_idx < len(self._temp_list):
+                target_k = self._temp_list[temp_idx]
+
                 if self._abort_flag:
                     self.experiment_aborted.emit()
                     log_file.close()
                     return
 
-                _log(f"→ Stabilising to {target_k:.1f} K ...")
+                # ---- 4K 豁免标记（需求 C） ----
+                _skip_validation = _rollback_state.is_skip_validation_temp(target_k)
+                if _skip_validation:
+                    _log(f"→ Stabilising to {target_k:.1f} K ... "
+                         f"[4K: 跳过温度范围检定，仅判定稳态]")
+                else:
+                    _log(f"→ Stabilising to {target_k:.1f} K ...")
 
                 # ---- 读取当前温度 ----
                 actual_k = target_k
@@ -638,7 +1057,10 @@ class ExperimentWorker(QObject):
                 from ui.experiment_stability_controller import (
                     ExperimentStabilityController,
                 )
-                stability_ctrl = ExperimentStabilityController()
+                stability_ctrl = ExperimentStabilityController(log_callback=lambda msg: _log(msg))
+                stability_ctrl.set_overshoot_learning(_overshoot_learning)
+                stability_ctrl.MAX_WAIT_SECONDS = _extended_max_wait_s
+                stability_ctrl.skip_zone_check = _skip_validation
                 stability_ctrl.setup(
                     target_k=target_k,
                     current_temperature=actual_k,
@@ -666,8 +1088,11 @@ class ExperimentWorker(QObject):
                          f"设定点 → {setpoint_k:.3f} K{overshoot_info}")
 
                 # ---- 等待稳定性（2 阶段轮询） ----
+                _temp_skip_measurement = False
+                _was_soft_pass = False
                 start_t = _time.time()
                 prev_phase = "sparse"
+                last_mem_check = 0.0
 
                 while True:
                     if self._abort_flag:
@@ -725,11 +1150,72 @@ class ExperimentWorker(QObject):
                         self.temperature_stable.emit(target_k, actual_k)
                         break
                     elif result.reason == "timeout":
-                        _log(f"  Timeout at {target_k:.1f}K — "
-                             f"avg={result.avg_temp:.3f}K, "
-                             f"Δ={abs(result.avg_temp - target_k):.3f}K")
-                        self.temperature_stable.emit(target_k, actual_k)
-                        break
+                        _timeout_type = _rollback_state.classify_timeout(
+                            result.avg_temp, target_k)
+                        _delta = abs(result.avg_temp - target_k)
+                        if _timeout_type == "soft_pass":
+                            _log(f"  超时软通过 @ {target_k:.1f}K — "
+                                 f"avg={result.avg_temp:.3f}K, "
+                                 f"Δ={_delta:.3f}K ≤ "
+                                 f"{_rollback_state.soft_pass_band_k}K")
+                            self.temperature_stable.emit(target_k, actual_k)
+                            _was_soft_pass = True
+                            _rollback_state.record_result(temp_idx, "soft_pass")
+                            break
+                        else:
+                            _log(f"  超时跳过 @ {target_k:.1f}K — "
+                                 f"avg={result.avg_temp:.3f}K, "
+                                 f"Δ={_delta:.3f}K > "
+                                 f"{_rollback_state.soft_pass_band_k}K")
+                            self.temperature_stable.emit(target_k, actual_k)
+                            _rollback_state.record_result(temp_idx, "hard_fail")
+                            _temp_skip_measurement = True
+                            break
+
+                    # ---- periodic memory check（含主动保护） ----
+                    if mem_monitor:
+                        now = _time.time()
+                        if now - last_mem_check >= mem_check_interval:
+                            info = mem_monitor.check()
+                            _log(mem_monitor.format_info(info))
+                            if info.warning:
+                                _log(mem_monitor.format_warning(info))
+                            last_mem_check = now
+
+                            # 主动暂停保护: 可用内存低于自动暂停阈值
+                            auto_pause_mb = getattr(
+                                config, "memory_auto_pause_threshold_mb", 3072)
+                            if info.avail_phys_mb < auto_pause_mb:
+                                _log(
+                                    f"  ⚠ 系统可用内存仅 "
+                                    f"{info.avail_phys_mb:.0f} MB，"
+                                    f"触发自动暂停保护")
+                                self.memory_critical.emit(
+                                    f"系统可用内存仅 "
+                                    f"{info.avail_phys_mb:.0f} MB！\n\n"
+                                    f"实验已自动暂停，等待内存恢复。\n"
+                                    f"请关闭其他应用程序释放内存。\n\n"
+                                    f"每 30 秒检查一次，可用内存恢复至 "
+                                    f">{auto_pause_mb + 1024} MB 后自动继续。")
+                                # 等待内存恢复循环
+                                while True:
+                                    if self._abort_flag:
+                                        self.experiment_aborted.emit()
+                                        log_file.close()
+                                        return
+                                    _time.sleep(30)
+                                    pause_info = mem_monitor.check()
+                                    _log(
+                                        f"  [等待内存恢复] "
+                                        f"{mem_monitor.format_info(pause_info)}")
+                                    if (pause_info.avail_phys_mb
+                                            >= auto_pause_mb + 1024):
+                                        _log(
+                                            f"  ✓ 内存恢复至 "
+                                            f"{pause_info.avail_phys_mb:.0f} MB，"
+                                            f"继续实验")
+                                        break
+                                last_mem_check = _time.time()
 
                     # 阶段感知轮询间隔
                     poll_s = (config.fine_poll_seconds
@@ -738,9 +1224,9 @@ class ExperimentWorker(QObject):
                     _time.sleep(poll_s)
 
                 # ============================================================
-                # VNA power sweep + laser power sweep（含测量时温度监控）
+                # VNA power sweep + laser power sweep（含测量熔断 + 重启）
                 # ============================================================
-                MAX_MEASUREMENT_RESTARTS = 3  # 单个温度点最多重启测量次数
+                first_measurement_cycle = True
 
                 # 确保至少有一个 VNA 功率值
                 vna_powers = list(self._vna_power_list) if self._vna_power_list else []
@@ -752,11 +1238,96 @@ class ExperimentWorker(QObject):
                         vna_powers = [fallback]
                 vna_powers = sorted(set(vna_powers))
 
-                # 测量重启循环
+                # 测量重启循环（不限次数，由 max_wait 超时终止）
                 measurement_restarts = 0
+                self._laser_was_off = True   # Fix 3: 每个温度点初始时激光关闭
                 while True:
+                    # 需求 A: 超时硬失败 → 跳过此温度点所有测量
+                    if _temp_skip_measurement:
+                        _log(f"  跳过温度点 {target_k:.1f}K（超时硬失败）")
+                        break
+
+                    # ---- 预测量等待（仅首次测量循环） ----
+                    if first_measurement_cycle and _extended_pre_wait_s > 0:
+                        _log(f"  预测量等待 "
+                             f"{_extended_pre_wait_s / 60:.0f} min...")
+                        _time.sleep(_extended_pre_wait_s)
+                        try:
+                            if self._lakeshore_ctrl:
+                                t = self._lakeshore_ctrl.get_temperature("A")
+                                if t is not None:
+                                    actual_k = t
+                                    _log(f"  等待结束，当前温度: {actual_k:.3f} K")
+                        except Exception:
+                            pass
+
+                        # Fix 1: 验证等待后温度仍在目标公差内
+                        post_wait_delta = abs(actual_k - target_k)
+                        pre_wait_tolerance = getattr(
+                            config, "pre_measurement_wait_temp_tolerance_k", 0.5)
+                        if post_wait_delta > pre_wait_tolerance:
+                            _log(f"  ⚠ 预等待后温度偏离 {post_wait_delta:.3f}K "
+                                 f"> {pre_wait_tolerance}K，重新进入稳定性等待")
+                            # 重新建立 stability controller 并等待稳定
+                            stability_ctrl = ExperimentStabilityController(log_callback=lambda msg: _log(msg))
+                            stability_ctrl.set_overshoot_learning(_overshoot_learning)
+                            stability_ctrl.MAX_WAIT_SECONDS = self._max_wait_s
+                            stability_ctrl.setup(
+                                target_k=target_k,
+                                current_temperature=actual_k,
+                            )
+                            if self._lakeshore_ctrl:
+                                fixed_pid = stability_ctrl.get_fixed_pid()
+                                self._lakeshore_ctrl.set_pid(
+                                    fixed_pid["p"], fixed_pid["i"],
+                                    fixed_pid["d"], loop=1)
+                                new_sp = stability_ctrl.needs_setpoint_adjustment()
+                                if new_sp is not None:
+                                    self._lakeshore_ctrl.set_temperature(new_sp, loop=1)
+
+                            wait_start = _time.time()
+                            while True:
+                                if self._abort_flag:
+                                    self.experiment_aborted.emit()
+                                    log_file.close()
+                                    return
+                                try:
+                                    actual_k = self._lakeshore_ctrl.get_temperature("A") \
+                                        if self._lakeshore_ctrl else target_k
+                                except Exception:
+                                    _time.sleep(10)
+                                    continue
+                                if actual_k is None:
+                                    actual_k = target_k
+                                stability_ctrl.add_reading(actual_k)
+                                self.temperature_stabilizing.emit(target_k, actual_k)
+
+                                elapsed = _time.time() - wait_start
+                                result = stability_ctrl.check(elapsed)
+
+                                new_sp = stability_ctrl.needs_setpoint_adjustment()
+                                if new_sp is not None:
+                                    self._apply_setpoint_adjustment(
+                                        new_sp, stability_ctrl.current_overshoot,
+                                        stability_ctrl.base_overshoot, actual_k)
+
+                                if result.stable or result.reason == "good_enough":
+                                    _log(f"  重稳定完成: {actual_k:.3f} K")
+                                    self.temperature_stable.emit(target_k, actual_k)
+                                    break
+                                elif result.reason == "timeout":
+                                    _log(f"  重稳定超时 — 以 good_enough 模式继续")
+                                    break
+
+                                poll_s = (config.fine_poll_seconds
+                                          if stability_ctrl.phase.value == "fine"
+                                          else config.sparse_poll_seconds)
+                                _time.sleep(poll_s)
+                    first_measurement_cycle = False
+
                     measurement_ok = True
                     deleted_any = False
+                    measurement_temps = []  # 跟踪所有 pre_temp，用于 ΔT 熔断检测
 
                     # Apply VNA freq + S-param once per restart
                     if self._vna and self._vna_settings:
@@ -804,15 +1375,59 @@ class ExperimentWorker(QObject):
                             self.measurement_started.emit(pre_temp, power_mw)
                             _log(f"  Measuring {vna_dbm:+d} dBm / "
                                  f"{power_mw} mW @ {pre_temp:.3f} K")
+                            measurement_temps.append(pre_temp)
+
+                            # ---- ΔT 熔断检查: 任意两次测量 pre_temp 差 > 0.25K ----
+                            if len(measurement_temps) >= 2:
+                                temp_range = (max(measurement_temps)
+                                              - min(measurement_temps))
+                                if temp_range > config.inter_measurement_max_delta_k:
+                                    _log(
+                                        f"  ⛔ 测量中温度漂移熔断: "
+                                        f"max-min={temp_range:.3f}K "
+                                        f"> {config.inter_measurement_max_delta_k}K, "
+                                        f"读数="
+                                        f"{[f'{t:.3f}' for t in measurement_temps]}")
+                                    # 将当前文件移至 discarded/
+                                    discarded_dir = os.path.join(
+                                        self._output_dir, temp_str, "discarded")
+                                    os.makedirs(discarded_dir, exist_ok=True)
+                                    discarded_path = os.path.join(
+                                        discarded_dir, filename)
+                                    if os.path.exists(filepath):
+                                        os.rename(filepath, discarded_path)
+                                        _log(
+                                            f"  异常数据已移至: "
+                                            f"discarded/{filename}")
+                                    # 放弃本轮所有已测数据，触发重启
+                                    measurement_ok = False
+                                    deleted_any = True
+                                    break  # 跳出激光功率循环
 
                             # apply laser
                             if self._laser_ctrl:
+                                # Fix 3: 跟踪激光是否首次上电，选择不同沉降时间
+                                laser_was_off = self._laser_was_off
                                 if power_mw == 0:
                                     self._laser_ctrl.output_off()
+                                    self._laser_was_off = True
                                 else:
                                     self._laser_ctrl.set_power(power_mw)
                                     self._laser_ctrl.output_on()
-                                _time.sleep(20)  # optical settle
+                                    self._laser_was_off = False
+                                settle_s = (config.laser_first_on_settle_time_s
+                                            if laser_was_off and power_mw > 0
+                                            else config.laser_settle_time_s)
+                                _time.sleep(settle_s)
+                                # 沉降后读取并记录温度，方便诊断激光加热效应
+                                try:
+                                    if self._lakeshore_ctrl:
+                                        t_after = self._lakeshore_ctrl.get_temperature("A")
+                                        if t_after is not None:
+                                            _log(f"  激光沉降后温度: {t_after:.3f} K "
+                                                 f"(Δ={t_after - pre_temp:+.3f} K)")
+                                except Exception:
+                                    pass
 
                             # ---- 输出路径 ----
                             temp_str = f"{target_k:.0f}K"
@@ -852,7 +1467,8 @@ class ExperimentWorker(QObject):
 
                             # ---- 测量时温度监控 ----
                             temp_ok, temp_reason = self._check_measurement_temp(
-                                pre_temp, post_temp, target_k)
+                                pre_temp, post_temp, target_k,
+                                laser_power_mw=power_mw)
 
                             if not temp_ok:
                                 _log(f"  ⚠ 测量温度异常: {temp_reason}")
@@ -881,18 +1497,36 @@ class ExperimentWorker(QObject):
                         # 测量全部通过
                         break
 
-                    # ---- 测量异常 → 重启稳定性 ----
+                    # Fix 2: 熔断重启上限检查
+                    if measurement_restarts >= config.max_meltdown_restarts:
+                        _log(f"  ⛔ 熔断重启已达上限 "
+                             f"({measurement_restarts}/{config.max_meltdown_restarts})，"
+                             f"跳过温度点 {target_k:.1f}K")
+                        # 确保激光已关闭再跳至下一温度点
+                        if self._laser_ctrl:
+                            try:
+                                self._laser_ctrl.set_power(0)
+                                self._laser_ctrl.output_off()
+                            except Exception:
+                                pass
+                        self._laser_was_off = True
+                        # 需求 B: 熔断跳过计入连续问题
+                        _rollback_state.record_result(temp_idx, "meltdown_skip")
+                        break  # 跳出 while True → 下一温度点
+
+                    # ---- 测量异常 → 重启稳定性（不限次数，由 max_wait 终止） ----
                     measurement_restarts += 1
-                    _log(f"  ⚠ 测量重启 #{measurement_restarts}"
-                         f"/{MAX_MEASUREMENT_RESTARTS} — 重新等待温度稳定")
+                    if deleted_any:
+                        _log(f"  ⚠ 测量熔断 #{measurement_restarts}"
+                             f" — 重新等待温度稳定（跳过预等待）")
+                    else:
+                        _log(f"  ⚠ 测量重启 #{measurement_restarts}"
+                             f" — 重新等待温度稳定")
 
-                    if measurement_restarts >= MAX_MEASUREMENT_RESTARTS:
-                        _log(f"  ⚠ 已达最大测量重启次数"
-                             f"({MAX_MEASUREMENT_RESTARTS})，"
-                             f"以 good_enough 模式继续")
-                        break
-
-                    # 重新等待稳定性
+                    # 重新等待稳定性（使用相同的 max_wait 超时）
+                    stability_ctrl = ExperimentStabilityController(log_callback=lambda msg: _log(msg))
+                    stability_ctrl.set_overshoot_learning(_overshoot_learning)
+                    stability_ctrl.MAX_WAIT_SECONDS = self._max_wait_s
                     stability_ctrl.setup(
                         target_k=target_k,
                         current_temperature=actual_k,
@@ -955,11 +1589,89 @@ class ExperimentWorker(QObject):
                     self._laser_ctrl.output_off()
                     _log(f"  温度点完成，激光功率 → 0 mW（准备升温）")
 
+                # ---- 需求 B: 连续问题回退 / 正常前进 ----
+                # 正常稳定通过 → 重置连续问题计数 + 记录 overshoot 学习
+                if not _temp_skip_measurement and not _was_soft_pass:
+                    _rollback_state.record_result(temp_idx, "stable")
+                    try:
+                        stability_ctrl.record_result()
+                        _overshoot_learning.update(
+                            stability_ctrl.get_overshoot_learning())
+                    except Exception:
+                        pass  # stability_ctrl 可能已被外部重新赋值，安全忽略
+
+                # 检查是否触发回退
+                if (_rollback_state.consecutive_issues >=
+                        _rollback_state.consecutive_threshold
+                        and _rollback_state.first_issue_index is not None):
+                    _rb_idx = _rollback_state.first_issue_index
+                    _rb_temp = self._temp_list[_rb_idx]
+                    _rb_max_wait, _rb_pre_wait = _rollback_state.get_rollback_params()
+                    _log(f"  ↩ 连续 {_rollback_state.consecutive_issues} 次问题 → "
+                         f"回退到 {_rb_temp:.1f}K "
+                         f"(第 {_rb_idx + 1}/{len(self._temp_list)} 个温度点)")
+                    _log(f"     max_wait +{_rb_max_wait / 60:.0f}min, "
+                         f"pre_wait +{_rb_pre_wait / 60:.0f}min "
+                         f"(第 {_rollback_state.rollback_count} 次回退)")
+
+                    if _rollback_state.rollback_count >= 2:
+                        # 同一回退点第二次 → 跳过，不再回退
+                        _log(f"     ⚠ 第 {_rollback_state.rollback_count} 次回退，"
+                             f"放弃回退，跳过 {_rb_temp:.1f}K 并继续")
+                        _rollback_state.reset_after_rollback()
+                        temp_idx += 1
+                    else:
+                        # 执行回退
+                        _extended_max_wait_s = self._max_wait_s + _rb_max_wait
+                        _extended_pre_wait_s = (
+                            self._pre_measurement_wait_s + _rb_pre_wait)
+                        _rollback_state.reset_after_rollback()
+                        temp_idx = _rb_idx  # 跳回第一个问题温度点
+                        continue  # 回到 while temp_idx < len(...) 顶部
+                else:
+                    temp_idx += 1
+
             # ================================================================
-            # 实验完成 — 生成 readme.txt
+            # 实验完成 — GC + 内存摘要 + 长时间运行提示 + readme.txt
             # ================================================================
             end_time = datetime.now()
             _log(f"Experiment complete — {count} measurements")
+
+            # ---- 保存 overshoot 学习数据到 app_settings.json ----
+            if _overshoot_learning:
+                try:
+                    import json as _json2
+                    _settings_path = os.path.join(
+                        os.path.dirname(os.path.dirname(__file__)),
+                        "app_settings.json")
+                    _settings = {}
+                    if os.path.exists(_settings_path):
+                        with open(_settings_path, "r", encoding="utf-8") as _f2:
+                            _settings = _json2.load(_f2)
+                    _settings["overshoot_learning"] = {
+                        str(k): v for k, v in _overshoot_learning.items()}
+                    with open(_settings_path, "w", encoding="utf-8") as _f2:
+                        _json2.dump(_settings, _f2, indent=2, ensure_ascii=False)
+                    _log(f"已保存 overshoot 学习数据: "
+                         f"{len(_overshoot_learning)} 个温度点")
+                except Exception as _save_err:
+                    _log(f"  ⚠ 保存 overshoot 学习数据失败: {_save_err}")
+
+            # ---- 强制垃圾回收，释放循环引用 ----
+            _gc.collect()
+            if mem_monitor:
+                for line in mem_monitor.summary().split("\n"):
+                    _log(line)
+
+            # ---- 长时间运行建议重启 GUI ----
+            elapsed_hours = (end_time - start_time).total_seconds() / 3600
+            warn_hours = getattr(config, "long_experiment_warning_hours", 2.0)
+            if elapsed_hours >= warn_hours:
+                _log(
+                    f"  💡 实验已运行 {elapsed_hours:.1f} 小时。")
+                _log(
+                    f"     建议重启 GUI 以释放 Python 进程累积的内存，"
+                    f"避免下次实验时 OOM。")
 
             try:
                 from readme_generator import generate_readme
