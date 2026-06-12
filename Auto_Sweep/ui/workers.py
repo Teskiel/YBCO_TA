@@ -794,6 +794,12 @@ class ExperimentWorker(QObject):
     experiment_aborted = pyqtSignal()
     memory_critical = pyqtSignal(str)                        # 内存严重不足弹窗告警
 
+    # ---- 断点续传信号 ----
+    experiment_recovering = pyqtSignal(str)           # 连接丢失，进入重连
+    experiment_recovered = pyqtSignal()               # 重连成功
+    experiment_recovery_timeout = pyqtSignal()        # 重连超时
+    experiment_resume_prompt = pyqtSignal(str, int)   # 恢复询问 (exp_id, completed_n)
+
     def __init__(self):
         super().__init__()
         self._abort_flag = False
@@ -984,6 +990,122 @@ class ExperimentWorker(QObject):
                     f" = {delta:.3f}K > 0.3K")
 
         return (True, "")
+
+    # ------------------------------------------------------------------
+    # 断点续传: 保存检查点
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(self):
+        """保存当前运行状态到 checkpoint.json。（Task 8 完成完整实现）"""
+        import os as _os
+        from datetime import datetime
+
+        state = {
+            "temp_idx": getattr(self, "_checkpoint_temp_idx", 0),
+            "vna_dbm_idx": getattr(self, "_checkpoint_vna_idx", 0),
+            "power_mw_idx": getattr(self, "_checkpoint_power_idx", 0),
+            "current_temp_k": getattr(self, "_checkpoint_current_temp",
+                                       self._temp_list[0] if self._temp_list else 0),
+            "total_count": getattr(self, "_checkpoint_total_count", 0),
+            "extended_max_wait_s": getattr(self, "_checkpoint_max_wait", 1800),
+            "extended_pre_wait_s": getattr(self, "_checkpoint_pre_wait", 0),
+            "rollback_consecutive_issues": getattr(
+                self, "_checkpoint_consecutive", 0),
+            "rollback_first_issue_index": getattr(
+                self, "_checkpoint_first_issue_idx", None),
+            "rollback_count": getattr(self, "_checkpoint_rollback_count", 0),
+            "overshoot_learning": getattr(self, "_checkpoint_overshoot", {}),
+        }
+
+        completed = getattr(self, "_checkpoint_completed_points", [])
+
+        CheckpointManager.save(
+            self._output_dir, state, completed,
+            experiment_id=_os.path.basename(self._output_dir),
+            original_temp_list=self._temp_list,
+            original_vna_power_list=self._vna_power_list,
+            original_power_list=self._power_list,
+        )
+
+    # ------------------------------------------------------------------
+    # 断点续传: 重连循环
+    # ------------------------------------------------------------------
+
+    def _enter_recovery(self, error: Exception):
+        """连接丢失后的恢复流程: 保存检查点 → 循环重连。
+
+        在 run() 的顶层 except 块中调用。
+
+        Args:
+            error: 触发恢复的异常
+        """
+        import time as _time
+        import config
+
+        self.progress.emit(f"  ⛔ VISA 连接丢失: {error}")
+        self.progress.emit(f"  正在保存检查点...")
+
+        # 保存当前状态
+        self._save_checkpoint()
+
+        # 通知 GUI
+        self.experiment_recovering.emit(str(error))
+
+        # 重连循环
+        max_attempts = (config.reconnect_max_wait_minutes * 60 //
+                        config.reconnect_retry_interval_s)
+        for attempt in range(1, max_attempts + 1):
+            if self._abort_flag:
+                self.progress.emit("  用户中止 — 检查点已保存")
+                self.experiment_aborted.emit()
+                return
+
+            self.progress.emit(
+                f"  重连尝试 #{attempt}/{max_attempts} "
+                f"(等待 {config.reconnect_retry_interval_s}s)...")
+            _time.sleep(config.reconnect_retry_interval_s)
+
+            # 尝试重新连接所有设备
+            all_ok = True
+
+            if self._lakeshore_ctrl:
+                try:
+                    t = self._lakeshore_ctrl.get_temperature("A")
+                    if t is None:
+                        raise Exception("temperature read returned None")
+                    self.progress.emit(f"  ✓ LakeShore 重连成功 ({t:.3f} K)")
+                except Exception as e:
+                    self.progress.emit(f"  ✗ LakeShore 重连失败: {e}")
+                    all_ok = False
+
+            if self._laser_ctrl:
+                try:
+                    self._laser_ctrl.get_status()
+                    self.progress.emit(f"  ✓ Laser 重连成功")
+                except Exception as e:
+                    self.progress.emit(f"  ✗ Laser 重连失败: {e}")
+                    all_ok = False
+
+            if self._vna:
+                try:
+                    idn = self._vna.query("*IDN?").strip()
+                    self.progress.emit(f"  ✓ VNA 重连成功: {idn}")
+                except Exception as e:
+                    self.progress.emit(f"  ✗ VNA 重连失败: {e}")
+                    all_ok = False
+
+            if all_ok:
+                self.progress.emit("  ✓ 所有设备重连成功，恢复实验")
+                self.experiment_recovered.emit()
+                # 递归调用 run() 从检查点恢复
+                self.run()
+                return
+
+        # 超时
+        self.progress.emit(
+            f"  ⛔ 重连超时 ({config.reconnect_max_wait_minutes}min)，"
+            f"检查点已保存，可稍后手动恢复")
+        self.experiment_recovery_timeout.emit()
 
     # ------------------------------------------------------------------
     # 实验主循环
