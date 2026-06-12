@@ -879,6 +879,68 @@ class ExperimentWorker(QObject):
             self.progress.emit(f"  设定点写入失败: {e}")
 
     # ------------------------------------------------------------------
+    # 断点续传: 异常分类
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_recoverable_error(exc: Exception) -> bool:
+        """判断异常是否为可恢复的 VISA 连接错误。
+
+        Returns:
+            True 如果是连接错误（应触发断点续传）
+            False 如果是逻辑错误（应终止实验）
+        """
+        msg = str(exc)
+
+        # VISA 标准连接丢失错误码
+        if "VI_ERROR_CONN_LOST" in msg:
+            return True
+
+        # 连接断开关键字（大小写不敏感）
+        recoverable_keywords = [
+            "timeout", "disconnected", "closed", "lost",
+            "not responding", "connection", "tcpip", "hislip",
+        ]
+        msg_lower = msg.lower()
+        for kw in recoverable_keywords:
+            if kw in msg_lower:
+                return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # 断点续传: S2P 文件去重
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_filename(temp_k: float, vna_dbm: int, power_mw: int,
+                        actual_k: float, attempt: int = 0) -> str:
+        """构建 S2P 文件名（支持 attempt 后缀用于去重）。"""
+        base = (f"YBCO_{vna_dbm:+d}dBm_{power_mw:02d}mW_"
+                f"target_{temp_k:.0f}K")
+        if attempt > 0:
+            return f"{base}_attempt{attempt}_actual_{actual_k:.3f}K.s2p"
+        return f"{base}_actual_{actual_k:.3f}K.s2p"
+
+    @staticmethod
+    def _find_next_filename(folder: str, temp_k: float, vna_dbm: int,
+                            power_mw: int, actual_k: float) -> str:
+        """扫描已有 S2P 文件，返回不冲突的文件名。
+
+        规则：仅当同 (temp_k, vna_dbm, power_mw) + 同 actual_k 时
+        才递增 attempt。不同 actual_k 不视为冲突（温度自然漂移的结果）。
+        """
+        import os as _os
+
+        attempt = 0
+        while True:
+            name = ExperimentWorker._build_filename(
+                temp_k, vna_dbm, power_mw, actual_k, attempt)
+            if not _os.path.exists(_os.path.join(folder, name)):
+                return name
+            attempt += 1
+
+    # ------------------------------------------------------------------
     # 测量时温度监控
     # ------------------------------------------------------------------
 
