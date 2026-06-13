@@ -212,3 +212,10 @@ reconnect_retry_interval_s = 30          # 重连尝试间隔（秒）
 reconnect_max_wait_minutes = 30          # 最大等待重连时间（分钟）
 checkpoint_save_interval_points = 5      # 每完成 N 个测量点增量保存检查点
 checkpoint_keep_latest_attempt_only = True  # 实验正常结束时仅保留最新 attempt 的 S2P
+
+# =========================================================================
+# 进程看门狗 & 心跳
+# =========================================================================
+
+heartbeat_interval_s = 60          # 心跳写入间隔（秒）
+heartbeat_timeout_s = 300          # 挂死判定阈值（秒）
