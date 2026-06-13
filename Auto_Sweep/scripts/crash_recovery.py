@@ -357,9 +357,126 @@ def _generate_recommendations(crash_type: str, trigger: str,
 # Phase 3: 文件恢复 (stub — Task 2 实现)
 # ---------------------------------------------------------------------------
 
-def recover(transcript_dir: str, project_root: str, files: list, dry_run: bool = False) -> dict:
-    """Phase 3: 从 transcript 恢复指定文件。 (stub — implemented in Task 2)"""
-    return {"recovered": [], "conflicts": [], "skipped": [{"file": "stub", "reason": "not yet implemented"}]}
+def recover_file_write(filepath: str, content: str, dry_run: bool = False) -> dict:
+    """Restore a file from a full Write operation's content.
+
+    Returns: {"status": "recovered"|"skipped", "reason": "..."}
+    """
+    target = Path(filepath)
+
+    # Check if file already matches (idempotent)
+    if target.exists() and target.read_text(encoding="utf-8", errors="replace") == content:
+        return {"status": "skipped", "reason": "file already matches recovered content"}
+
+    if not dry_run:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {"status": "recovered", "reason": "written from transcript"}
+    else:
+        return {"status": "recovered", "reason": "[dry-run] would write"}
+
+
+def recover_file_edits(filepath: str, edits: list, dry_run: bool = False) -> dict:
+    """Apply a chain of Edit operations to the current file content.
+
+    Each edit is {"old": str, "new": str}. Applied in order.
+    If old_string not found, skip and record conflict.
+    Uses replace() with count=1 to match Claude Code Edit semantics.
+
+    Returns: {"status": "recovered"|"partial"|"conflict", "reason": "...",
+              "conflict_file": "..."|null}
+    """
+    target = Path(filepath)
+    if not target.exists():
+        return {"status": "conflict", "reason": "file does not exist on disk, cannot apply edits",
+                "conflict_file": None}
+
+    content = target.read_text(encoding="utf-8", errors="replace")
+    original = content
+    applied = 0
+    conflicts = []
+
+    for i, edit in enumerate(edits):
+        old = edit["old"]
+        new = edit["new"]
+        if old in content:
+            content = content.replace(old, new, 1)
+            applied += 1
+        else:
+            conflicts.append({"index": i, "old_preview": old[:80], "new_preview": new[:80]})
+
+    if applied == 0:
+        # Nothing applied, save conflict file
+        conflict_path = str(target) + ".recover_conflict"
+        conflict_content = "\n---\n".join(
+            f"# Edit {c['index']}: old_string not found in current file\n"
+            f"# OLD:\n{c['old_preview']}\n"
+            f"# NEW:\n{c['new_preview']}"
+            for c in conflicts
+        )
+        if not dry_run:
+            Path(conflict_path).write_text(conflict_content, encoding="utf-8")
+        return {"status": "conflict", "reason": f"{len(conflicts)} edits could not be applied",
+                "conflict_file": conflict_path}
+
+    if content == original:
+        return {"status": "skipped", "reason": "all edits already applied (idempotent)"}
+
+    if not dry_run:
+        target.write_text(content, encoding="utf-8")
+        status = "recovered" if applied == len(edits) else "partial"
+        reason = f"applied {applied}/{len(edits)} edits"
+        if conflicts:
+            reason += f", {len(conflicts)} conflicts saved to {target}.recover_conflict"
+        return {"status": status, "reason": reason,
+                "conflict_file": str(target) + ".recover_conflict" if conflicts else None}
+    else:
+        return {"status": "recovered", "reason": f"[dry-run] would apply {applied}/{len(edits)} edits"}
+
+
+def recover(transcript_dir: str, project_root: str,
+            files: list, dry_run: bool = False) -> dict:
+    """Phase 3: 从 transcript 恢复指定文件。
+
+    Args:
+        transcript_dir: 含 .jsonl 文件的目录
+        project_root: 项目根目录（文件写入的相对基准）
+        files: 要恢复的文件路径列表
+        dry_run: 仅预览，不实际写入
+
+    Returns: {"recovered": [...], "conflicts": [...], "skipped": [...]}
+    """
+    # Re-parse transcript to get latest file contents
+    transcript_result = parse_transcript(transcript_dir)
+    lost_files = transcript_result["lost_files"]
+
+    recovered = []
+    conflicts = []
+    skipped = []
+
+    for fpath in files:
+        abs_path = os.path.join(project_root, fpath) if not os.path.isabs(fpath) else fpath
+
+        if fpath not in lost_files:
+            skipped.append({"file": fpath, "reason": "not found in transcript"})
+            continue
+
+        file_info = lost_files[fpath]
+
+        if file_info["recovery_type"] == "write":
+            result = recover_file_write(abs_path, file_info["content"], dry_run)
+        else:
+            result = recover_file_edits(abs_path, file_info["edits"], dry_run)
+
+        result["file"] = fpath
+        if result["status"] == "recovered":
+            recovered.append(result)
+        elif result["status"] == "conflict":
+            conflicts.append(result)
+        else:
+            skipped.append(result)
+
+    return {"recovered": recovered, "conflicts": conflicts, "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
