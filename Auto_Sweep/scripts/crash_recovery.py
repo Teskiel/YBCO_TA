@@ -13,7 +13,6 @@ import argparse
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -54,7 +53,7 @@ def scan_debug_log(log_path: str, tail_lines: int = 200) -> dict:
         for line in recent:
             m = re.search(pattern, line, re.IGNORECASE)
             if m:
-                if ctype:
+                if ctype and crash_type == "unknown":
                     crash_type = ctype
                     trigger = ctrigger
                 if pattern.startswith(r"queryDepth"):
@@ -66,12 +65,17 @@ def scan_debug_log(log_path: str, tail_lines: int = 200) -> dict:
         re.IGNORECASE
     )
     key_lines = []
+    key_lines_set = set()
     for i, line in enumerate(recent):
         if key_pattern.search(line):
             # Include 1 line of context before/after
             start = max(0, i - 1)
             end = min(len(recent), i + 2)
-            key_lines.extend(line.rstrip() for line in recent[start:end])
+            for j in range(start, end):
+                stripped = recent[j].rstrip()
+                if stripped not in key_lines_set:
+                    key_lines_set.add(stripped)
+                    key_lines.append(stripped)
             if len(key_lines) >= 30:
                 break
 
@@ -149,6 +153,15 @@ def parse_transcript(transcript_dir: str, last_commit_time: Optional[float] = No
         operations = [op for op in operations
                       if _parse_timestamp(op["time"]) > last_commit_time]
 
+        # Also filter file_ops to only include post-commit operations
+        filtered_file_ops = {}
+        for op in operations:
+            fpath = op["file"]
+            if fpath not in filtered_file_ops:
+                filtered_file_ops[fpath] = []
+            filtered_file_ops[fpath].append(op)
+        file_ops = filtered_file_ops
+
     # Classify each file: has Write (full recovery) vs Edit-only (patch recovery)
     lost_files = {}
     for fpath, ops in file_ops.items():
@@ -180,6 +193,15 @@ def _parse_timestamp(ts: str) -> float:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except Exception:
         return 0
+
+
+def _confidence(crash_type: str, trigger: str) -> str:
+    """Determine confidence level for crash diagnosis."""
+    if crash_type == "unknown":
+        return "low"
+    if trigger == "unknown":
+        return "medium"
+    return "high"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +280,15 @@ def diagnose(debug_log_path: str, transcript_dir: str, project_root: str,
     # 3. Parse transcript
     transcript_result = parse_transcript(transcript_dir, last_commit_time)
 
+    # Add status field to operation chain items
+    for op in transcript_result["operation_chain"]:
+        if last_commit_time and _parse_timestamp(op["time"]) <= last_commit_time:
+            op["status"] = "committed"
+        elif os.path.exists(os.path.join(project_root, op["file"])):
+            op["status"] = "on_disk"
+        else:
+            op["status"] = "transcript_only"
+
     # 4. Check git working tree
     try:
         diff_result = subprocess.run(
@@ -286,7 +317,7 @@ def diagnose(debug_log_path: str, transcript_dir: str, project_root: str,
         "crash": {
             "type": log_result["crash_type"],
             "trigger": log_result["trigger"],
-            "confidence": "high" if log_result["crash_type"] != "unknown" else "low",
+            "confidence": _confidence(log_result["crash_type"], log_result["trigger"]),
             "query_depth": log_result["query_depth"],
         },
         "log_lines": log_result["key_lines"],
