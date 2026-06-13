@@ -420,6 +420,10 @@ def recover_file_edits(filepath: str, edits: list, dry_run: bool = False) -> dic
                 "conflict_file": conflict_path}
 
     if content == original:
+        if conflicts:
+            # Edits cancelled each other out but some had conflicts
+            return {"status": "partial", "reason": f"content unchanged but {len(conflicts)} edits had conflicts",
+                    "conflict_file": str(target) + ".recover_conflict" if not dry_run else None}
         return {"status": "skipped", "reason": "all edits already applied (idempotent)"}
 
     if not dry_run:
@@ -457,11 +461,19 @@ def recover(transcript_dir: str, project_root: str,
     for fpath in files:
         abs_path = os.path.join(project_root, fpath) if not os.path.isabs(fpath) else fpath
 
-        if fpath not in lost_files:
+        # Normalize path for lookup (transcript uses forward-slash relative paths)
+        lookup_key = fpath.replace("\\", "/")
+        proj = project_root.replace("\\", "/").rstrip("/")
+        if lookup_key.startswith(proj + "/"):
+            lookup_key = lookup_key[len(proj) + 1:]
+        if lookup_key.startswith("./"):
+            lookup_key = lookup_key[2:]
+
+        if lookup_key not in lost_files:
             skipped.append({"file": fpath, "reason": "not found in transcript"})
             continue
 
-        file_info = lost_files[fpath]
+        file_info = lost_files[lookup_key]
 
         if file_info["recovery_type"] == "write":
             result = recover_file_write(abs_path, file_info["content"], dry_run)
