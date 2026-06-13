@@ -12,12 +12,51 @@ Requirements:
     pip install pyqt5 pyvisa
 """
 
+import argparse
 import sys
 from PyQt5.QtWidgets import QApplication
 from ui.main_window import MainWindow
 
 
+def parse_args():
+    """解析 CLI 参数。"""
+    parser = argparse.ArgumentParser(
+        description="YBCO Auto Sweep Control Panel"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, metavar="DIR",
+        help="从 checkpoint 恢复实验（需指定实验输出目录）",
+    )
+    parser.add_argument(
+        "--watchdog", action="store_true",
+        help="看门狗模式（监控实验进程心跳）",
+    )
+    parser.add_argument(
+        "--child-pid", type=int, default=None,
+        help="被监控进程 PID（仅 --watchdog）",
+    )
+    parser.add_argument(
+        "--resume-path", type=str, default=None, metavar="DIR",
+        help="实验输出目录（仅 --watchdog）",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
+
+    # ---- 模式 1: 看门狗 ----
+    if args.watchdog:
+        if not args.child_pid or not args.resume_path:
+            print("Error: --watchdog requires --child-pid and --resume-path")
+            return 1
+        from watchdog import run as watchdog_run
+        import config
+        timeout = getattr(config, "heartbeat_timeout_s", 300)
+        watchdog_run(args.child_pid, args.resume_path, timeout)
+        return 0
+
+    # ---- 模式 2 & 3: GUI (normal + resume) ----
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
@@ -170,7 +209,10 @@ def main() -> int:
         }
     """)
 
-    win = MainWindow()
+    # resume_path 传递给 MainWindow
+    resume_path = args.resume
+
+    win = MainWindow(resume_path=resume_path)
     win.show()
     return app.exec_()
 
