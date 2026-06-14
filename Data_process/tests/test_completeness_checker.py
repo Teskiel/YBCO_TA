@@ -1,0 +1,81 @@
+# -*- coding: utf-8 -*-
+"""completeness_checker.py 单元测试"""
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pytest
+import numpy as np
+from pathlib import Path
+import completeness_checker as cc
+
+
+@pytest.fixture
+def mock_merged_dir(tmp_path):
+    """
+    创建模拟合并目录：
+    6K, 8K, 10K × -25dBm, -30dBm × 00mW, 01mW, 03mW
+    故意缺失:
+      - 8K/-30dBm/01mW (isolated — 周围完整)
+      - 10K/-30dBm/00mW, 01mW, 03mW (连续3个 → block)
+    """
+    data = tmp_path
+    files_to_create = [
+        (6, 25, 0), (6, 25, 1), (6, 25, 3),
+        (6, 30, 0), (6, 30, 1), (6, 30, 3),
+        (8, 25, 0), (8, 25, 1), (8, 25, 3),
+        # 故意缺失: 8K/-30dBm/01mW
+        (8, 30, 0), (8, 30, 3),
+        (10, 25, 0), (10, 25, 1), (10, 25, 3),
+        # 故意缺失全部: 10K/-30dBm/*
+    ]
+    for temp, vna, laser in files_to_create:
+        d = data / f"{temp}K" / f"-{vna}dBm" / f"{laser:02d}mW"
+        d.mkdir(parents=True)
+        (d / "data.s2p").write_text("")
+    return data
+
+
+class TestBuildCompletenessMatrix:
+    """build_completeness_matrix() 测试"""
+
+    def test_correct_shape(self, mock_merged_dir):
+        """返回正确形状的 3D 布尔数组"""
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1, 3]
+        matrix = cc.build_completeness_matrix(
+            mock_merged_dir, temps, vna_powers, laser_powers)
+
+        assert matrix.shape == (3, 2, 3)
+        assert matrix.dtype == bool
+
+    def test_found_and_missing_cells(self, mock_merged_dir):
+        """正确标记存在和缺失的格子"""
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1, 3]
+        matrix = cc.build_completeness_matrix(
+            mock_merged_dir, temps, vna_powers, laser_powers)
+
+        # 6K 全部完整
+        assert matrix[0, :, :].all()
+        # 8K/-30dBm/01mW 缺失
+        assert matrix[1, 1, 0]     # 8K/-30dBm/00mW ✓
+        assert not matrix[1, 1, 1] # 8K/-30dBm/01mW ✗
+        assert matrix[1, 1, 2]     # 8K/-30dBm/03mW ✓
+        # 10K/-30dBm 全部缺失
+        assert matrix[2, 0, :].all()   # 10K/-25dBm 完整
+        assert not matrix[2, 1, :].any()  # 10K/-30dBm 全缺
+
+    def test_total_found_count(self, mock_merged_dir):
+        """sum(matrix) 等于实际文件数"""
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1, 3]
+        matrix = cc.build_completeness_matrix(
+            mock_merged_dir, temps, vna_powers, laser_powers)
+
+        n_expected = 3 * 2 * 3  # 18
+        assert int(matrix.sum()) == 18 - 1 - 3  # 14 (缺4个)
