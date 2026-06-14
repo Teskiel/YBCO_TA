@@ -32,6 +32,9 @@ PIXEL_INDX = 1
 MEAS_POWERS = [25, 30, 45]
 LASER_POWERS = [0, 1, 3, 5, 7, 9]
 
+# 深色背景色常量（用于 PPT 幻灯片统一主题）
+DARK_BG = (0x1A, 0x1A, 0x2E)
+
 # ============================================================
 # 数值提取
 # ============================================================
@@ -257,12 +260,12 @@ def _set_slide_bg(slide, r, g, b):
     fill.fore_color.rgb = RGBColor(r, g, b)
 
 
-def _build_optical_response_slide(prs, blank_layout, numbers,
+def _build_optical_response_slide(prs, blank_layout,
                                    temp_label, subdir, title_suffix,
                                    comparison_text):
     """构建光学响应幻灯片（Slide 4/5 共用模板）。"""
     slide = prs.slides.add_slide(blank_layout)
-    _set_slide_bg(slide, 0x1A, 0x1A, 0x2E)
+    _set_slide_bg(slide, *DARK_BG)
 
     subdir_path = OUTPUT_DIR / subdir
 
@@ -272,12 +275,17 @@ def _build_optical_response_slide(prs, blank_layout, numbers,
                  font_size=Pt(28), bold=True, color=WHITE)
 
     # 找到该子目录下的所有图片
-    s21_files = sorted([f for f in os.listdir(str(subdir_path)) if f.startswith("s21 -")])
+    s21_files = []
     res_shift_file = None
-    for f in os.listdir(str(subdir_path)):
-        if f.startswith("res shift -"):
-            res_shift_file = f
-            break
+
+    if subdir_path.is_dir():
+        # 按文件名排序确保确定性
+        all_files = sorted(os.listdir(str(subdir_path)))
+        s21_files = [f for f in all_files if f.startswith("s21 -")]
+        # 按温度排序后取第一个（最低温），确保确定性
+        res_shift_candidates = sorted([f for f in all_files if f.startswith("res shift -")])
+        if res_shift_candidates:
+            res_shift_file = res_shift_candidates[0]
 
     # 2×2 网格排列
     positions = [
@@ -287,17 +295,18 @@ def _build_optical_response_slide(prs, blank_layout, numbers,
         (Inches(3.7), Inches(4.0), Inches(3.0), Inches(2.6)),     # 右下（res shift）
     ]
 
-    # 前 3 个位置放 s21 图
+    # 只有找到图片时才添加
     for i, s21f in enumerate(s21_files[:3]):
         img_path = subdir_path / s21f
-        left, top, w, h = positions[i]
-        slide.shapes.add_picture(str(img_path), left, top, w, h)
+        if img_path.exists():
+            left, top, w, h = positions[i]
+            slide.shapes.add_picture(str(img_path), left, top, w, h)
 
-    # 第 4 个位置放 res shift 图
     if res_shift_file:
         img_path = subdir_path / res_shift_file
-        left, top, w, h = positions[3]
-        slide.shapes.add_picture(str(img_path), left, top, w, h)
+        if img_path.exists():
+            left, top, w, h = positions[3]
+            slide.shapes.add_picture(str(img_path), left, top, w, h)
 
     # 右侧要点
     _add_bullet_list(slide, Inches(7.2), Inches(1.5), Inches(5.5), Inches(5.5), [
@@ -316,7 +325,14 @@ def build_pptx(numbers):
     prs.slide_width = SLIDE_W
     prs.slide_height = SLIDE_H
 
-    blank_layout = prs.slide_layouts[6]  # blank
+    # 查找空白版式（跨 python-pptx 版本稳定）
+    blank_layout = None
+    for layout in prs.slide_layouts:
+        if layout.name == 'Blank' or layout.name == '空白':
+            blank_layout = layout
+            break
+    if blank_layout is None:
+        blank_layout = prs.slide_layouts[6]  # fallback
 
     WHITE = RGBColor(0xFF, 0xFF, 0xFF)
     GRAY = RGBColor(0xCC, 0xCC, 0xCC)
@@ -339,7 +355,7 @@ def build_pptx(numbers):
 
     # ---- Slide 1: 封面 ----
     slide1 = prs.slides.add_slide(blank_layout)
-    _set_slide_bg(slide1, 0x1A, 0x1A, 0x2E)
+    _set_slide_bg(slide1, *DARK_BG)
 
     _add_textbox(slide1, Inches(1), Inches(1.5), Inches(11), Inches(1.5),
                  "YBCO KID 微波-光学联合表征",
@@ -362,7 +378,7 @@ def build_pptx(numbers):
 
     # ---- Slide 2: 谐振峰检测与 S21 温度演化 ----
     slide2 = prs.slides.add_slide(blank_layout)
-    _set_slide_bg(slide2, 0x1A, 0x1A, 0x2E)
+    _set_slide_bg(slide2, *DARK_BG)
 
     _add_textbox(slide2, MARGIN, Inches(0.3), Inches(12), Inches(0.6),
                  "谐振器识别与全温 S21 叠加",
@@ -389,7 +405,7 @@ def build_pptx(numbers):
 
     # ---- Slide 3: f₀(T) 与 Qi(T) ----
     slide3 = prs.slides.add_slide(blank_layout)
-    _set_slide_bg(slide3, 0x1A, 0x1A, 0x2E)
+    _set_slide_bg(slide3, *DARK_BG)
 
     _add_textbox(slide3, MARGIN, Inches(0.3), Inches(12), Inches(0.6),
                  "谐振频率与内禀品质因子的温度响应",
@@ -416,7 +432,7 @@ def build_pptx(numbers):
 
     # ---- Slide 4: 低温光学响应 ----
     _build_optical_response_slide(
-        prs, blank_layout, numbers,
+        prs, blank_layout,
         temp_label="低温",
         subdir="05_optical_response_6K",
         title_suffix="（T ≈ 6K）",
@@ -425,7 +441,7 @@ def build_pptx(numbers):
 
     # ---- Slide 5: 高温光学响应 ----
     _build_optical_response_slide(
-        prs, blank_layout, numbers,
+        prs, blank_layout,
         temp_label="高温",
         subdir="06_optical_response_highT",
         title_suffix="（T ≈ 76K）",
@@ -434,7 +450,7 @@ def build_pptx(numbers):
 
     # ---- Slide 6: 响应率 vs 温度 ----
     slide6 = prs.slides.add_slide(blank_layout)
-    _set_slide_bg(slide6, 0x1A, 0x1A, 0x2E)
+    _set_slide_bg(slide6, *DARK_BG)
 
     _add_textbox(slide6, MARGIN, Inches(0.3), Inches(12), Inches(0.6),
                  "光学响应率的温度依赖性",
@@ -455,7 +471,7 @@ def build_pptx(numbers):
 
     # ---- Slide 7: 总结 ----
     slide7 = prs.slides.add_slide(blank_layout)
-    _set_slide_bg(slide7, 0x1A, 0x1A, 0x2E)
+    _set_slide_bg(slide7, *DARK_BG)
 
     _add_textbox(slide7, Inches(1), Inches(1.0), Inches(11), Inches(1.0),
                  "小结与下一步",
