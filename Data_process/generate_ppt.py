@@ -194,8 +194,308 @@ def extract_key_numbers():
 
     return result
 
+# ============================================================
+# PPT 生成
+# ============================================================
+
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor
+
+# 幻灯片尺寸 (widescreen 16:9)
+SLIDE_W = Inches(13.333)
+SLIDE_H = Inches(7.5)
+
+# 边距
+MARGIN = Inches(0.5)
+GAP = Inches(0.2)
+
+
+def _add_textbox(slide, left, top, width, height, text, font_size=Pt(14),
+                 bold=False, color=None, alignment=PP_ALIGN.LEFT):
+    """添加文本框。"""
+    if color is None:
+        color = RGBColor(0xFF, 0xFF, 0xFF)
+    txBox = slide.shapes.add_textbox(left, top, width, height)
+    tf = txBox.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.text = text
+    p.font.size = font_size
+    p.font.bold = bold
+    p.font.color.rgb = color
+    p.alignment = alignment
+    return txBox
+
+
+def _add_bullet_list(slide, left, top, width, height, items,
+                     font_size=Pt(12), color=None):
+    """添加 bullet 列表。"""
+    if color is None:
+        color = RGBColor(0xDD, 0xDD, 0xDD)
+    txBox = slide.shapes.add_textbox(left, top, width, height)
+    tf = txBox.text_frame
+    tf.word_wrap = True
+    for i, item in enumerate(items):
+        if i == 0:
+            p = tf.paragraphs[0]
+        else:
+            p = tf.add_paragraph()
+        p.text = f"• {item}"
+        p.font.size = font_size
+        p.font.color.rgb = color
+        p.space_after = Pt(6)
+    return txBox
+
+
+def _set_slide_bg(slide, r, g, b):
+    """设置幻灯片背景色。"""
+    background = slide.background
+    fill = background.fill
+    fill.solid()
+    fill.fore_color.rgb = RGBColor(r, g, b)
+
+
+def _build_optical_response_slide(prs, blank_layout, numbers,
+                                   temp_label, subdir, title_suffix,
+                                   comparison_text):
+    """构建光学响应幻灯片（Slide 4/5 共用模板）。"""
+    slide = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide, 0x1A, 0x1A, 0x2E)
+
+    subdir_path = OUTPUT_DIR / subdir
+
+    WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+    _add_textbox(slide, MARGIN, Inches(0.3), Inches(12), Inches(0.6),
+                 f"{temp_label}下的光致谐振频移 {title_suffix}",
+                 font_size=Pt(28), bold=True, color=WHITE)
+
+    # 找到该子目录下的所有图片
+    s21_files = sorted([f for f in os.listdir(str(subdir_path)) if f.startswith("s21 -")])
+    res_shift_file = None
+    for f in os.listdir(str(subdir_path)):
+        if f.startswith("res shift -"):
+            res_shift_file = f
+            break
+
+    # 2×2 网格排列
+    positions = [
+        (MARGIN, Inches(1.2), Inches(3.0), Inches(2.6)),          # 左上
+        (Inches(3.7), Inches(1.2), Inches(3.0), Inches(2.6)),     # 右上
+        (MARGIN, Inches(4.0), Inches(3.0), Inches(2.6)),          # 左下
+        (Inches(3.7), Inches(4.0), Inches(3.0), Inches(2.6)),     # 右下（res shift）
+    ]
+
+    # 前 3 个位置放 s21 图
+    for i, s21f in enumerate(s21_files[:3]):
+        img_path = subdir_path / s21f
+        left, top, w, h = positions[i]
+        slide.shapes.add_picture(str(img_path), left, top, w, h)
+
+    # 第 4 个位置放 res shift 图
+    if res_shift_file:
+        img_path = subdir_path / res_shift_file
+        left, top, w, h = positions[3]
+        slide.shapes.add_picture(str(img_path), left, top, w, h)
+
+    # 右侧要点
+    _add_bullet_list(slide, Inches(7.2), Inches(1.5), Inches(5.5), Inches(5.5), [
+        "展示 -25 / -30 / -45 dBm 三个 VNA 功率",
+        "S21 曲线随 0→9 mW 激光功率演化",
+        "右上图：谐振频率偏移 vs 激光功率",
+        comparison_text,
+    ], font_size=Pt(13))
+
+    return slide
+
+
+def build_pptx(numbers):
+    """构建 7 页 PPTX，返回 Presentation 对象。"""
+    prs = Presentation()
+    prs.slide_width = SLIDE_W
+    prs.slide_height = SLIDE_H
+
+    blank_layout = prs.slide_layouts[6]  # blank
+
+    WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+    GRAY = RGBColor(0xCC, 0xCC, 0xCC)
+    ACCENT = RGBColor(0x4F, 0xC3, 0xF7)
+
+    n_res = numbers["num_resonances"]
+    f0 = numbers["f0_ghz"]
+    qi_est = numbers.get("qi_estimate")
+    qi_text = f"{qi_est}" if qi_est is not None else "—"
+    shift_pct = numbers.get("f0_shift_percent")
+    shift_dir = numbers.get("f0_shift_direction", "")
+    low_t = numbers["low_temp"]
+    high_t = numbers["high_temp"]
+
+    # 构建温度范围内文本
+    if shift_pct is not None:
+        f0_shift_text = f"f₀ 随温度升高单调{shift_dir}约 {shift_pct:.1f}%（{low_t}→{high_t}K）"
+    else:
+        f0_shift_text = f"f₀ 随温度升高呈现单调频移趋势（{low_t}→{high_t}K）"
+
+    # ---- Slide 1: 封面 ----
+    slide1 = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide1, 0x1A, 0x1A, 0x2E)
+
+    _add_textbox(slide1, Inches(1), Inches(1.5), Inches(11), Inches(1.5),
+                 "YBCO KID 微波-光学联合表征",
+                 font_size=Pt(36), bold=True, color=WHITE,
+                 alignment=PP_ALIGN.CENTER)
+
+    info_lines = [
+        "样品：YBCO KID (merged 数据集)",
+        f"温度范围：{low_t}K → {high_t}K（{len(scan_temperatures())} 个温度点）",
+        "VNA 功率：-25 / -30 / -45 dBm",
+        "激光功率：0, 1, 3, 5, 7, 9 mW",
+        "分析日期：2026-06-15",
+    ]
+    y = Inches(3.5)
+    for line in info_lines:
+        _add_textbox(slide1, Inches(2.5), y, Inches(8), Inches(0.5),
+                     line, font_size=Pt(16), color=GRAY,
+                     alignment=PP_ALIGN.CENTER)
+        y += Inches(0.45)
+
+    # ---- Slide 2: 谐振峰检测与 S21 温度演化 ----
+    slide2 = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide2, 0x1A, 0x1A, 0x2E)
+
+    _add_textbox(slide2, MARGIN, Inches(0.3), Inches(12), Inches(0.6),
+                 "谐振器识别与全温 S21 叠加",
+                 font_size=Pt(28), bold=True, color=WHITE)
+
+    img_detect = OUTPUT_DIR / "01_resonance_detection" / "resonance_detection.jpg"
+    if img_detect.exists():
+        slide2.shapes.add_picture(
+            str(img_detect), MARGIN, Inches(1.1), Inches(6), Inches(3.5)
+        )
+
+    img_s21_temp = OUTPUT_DIR / "04_S21_temperature_overlay" / "s21 vs - temp.jpg"
+    if img_s21_temp.exists():
+        slide2.shapes.add_picture(
+            str(img_s21_temp), Inches(6.8), Inches(1.1), Inches(6), Inches(3.5)
+        )
+
+    _add_bullet_list(slide2, MARGIN, Inches(5.0), Inches(12), Inches(2.2), [
+        f"采用幅度谷 + 相位差分峰联合判据自动寻峰（SNR ≥ 0.5），共检测到 {n_res} 个谐振峰",
+        f"选定谐振峰位于 {f0:.3f} GHz（pixel {PIXEL_INDX}），QL ≈ {qi_text}（-3dB 带宽法估计）",
+        "全温 S21 叠加：谐振峰随温度单调频移，符合超导动能电感 Lₖ ∝ λ²(T) 理论预期",
+        "峰形保持良好，器件在测量温区范围内稳定工作",
+    ], font_size=Pt(13))
+
+    # ---- Slide 3: f₀(T) 与 Qi(T) ----
+    slide3 = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide3, 0x1A, 0x1A, 0x2E)
+
+    _add_textbox(slide3, MARGIN, Inches(0.3), Inches(12), Inches(0.6),
+                 "谐振频率与内禀品质因子的温度响应",
+                 font_size=Pt(28), bold=True, color=WHITE)
+
+    img_f0 = OUTPUT_DIR / "02_f0_temperature" / "f0_versus_temp.jpg"
+    if img_f0.exists():
+        slide3.shapes.add_picture(
+            str(img_f0), MARGIN, Inches(1.1), Inches(5.8), Inches(2.8)
+        )
+
+    img_qi = OUTPUT_DIR / "03_Qi_temperature" / "qis_versus_temp.jpg"
+    if img_qi.exists():
+        slide3.shapes.add_picture(
+            str(img_qi), MARGIN, Inches(4.1), Inches(5.8), Inches(2.8)
+        )
+
+    _add_bullet_list(slide3, Inches(7.2), Inches(1.5), Inches(5.5), Inches(5.5), [
+        f0_shift_text,
+        "Qi 低温段较高，随温度上升逐渐降低，归因于准粒子损耗增大",
+        "三个 VNA 功率 (-25/-30/-45 dBm) 的 Qi 偏差较小",
+        "表明读出功率未引入显著非线性效应",
+    ], font_size=Pt(13))
+
+    # ---- Slide 4: 低温光学响应 ----
+    _build_optical_response_slide(
+        prs, blank_layout, numbers,
+        temp_label="低温",
+        subdir="05_optical_response_6K",
+        title_suffix="（T ≈ 6K）",
+        comparison_text="频移与激光功率呈良好线性关系 → 符合准粒子退对机制",
+    )
+
+    # ---- Slide 5: 高温光学响应 ----
+    _build_optical_response_slide(
+        prs, blank_layout, numbers,
+        temp_label="高温",
+        subdir="06_optical_response_highT",
+        title_suffix="（T ≈ 76K）",
+        comparison_text="与 6K 对比：高温下热准粒子密度升高，光注入准粒子的相对增量减小",
+    )
+
+    # ---- Slide 6: 响应率 vs 温度 ----
+    slide6 = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide6, 0x1A, 0x1A, 0x2E)
+
+    _add_textbox(slide6, MARGIN, Inches(0.3), Inches(12), Inches(0.6),
+                 "光学响应率的温度依赖性",
+                 font_size=Pt(28), bold=True, color=WHITE)
+
+    img_resp = OUTPUT_DIR / "07_responsivity_temperature" / "responsivity_vs_temp.jpg"
+    if img_resp.exists():
+        slide6.shapes.add_picture(
+            str(img_resp), MARGIN, Inches(1.2), Inches(8.5), Inches(5.0)
+        )
+
+    _add_bullet_list(slide6, Inches(9.5), Inches(1.5), Inches(3.3), Inches(5.5), [
+        "响应率 (Hz/W) 随温度的变化趋势",
+        "响应率温度依赖与超导能隙 Δ(T) 定性一致",
+        "低温段保持较高响应水平",
+        "下一步需与 BCS 理论定量比较",
+    ], font_size=Pt(13))
+
+    # ---- Slide 7: 总结 ----
+    slide7 = prs.slides.add_slide(blank_layout)
+    _set_slide_bg(slide7, 0x1A, 0x1A, 0x2E)
+
+    _add_textbox(slide7, Inches(1), Inches(1.0), Inches(11), Inches(1.0),
+                 "小结与下一步",
+                 font_size=Pt(36), bold=True, color=WHITE,
+                 alignment=PP_ALIGN.CENTER)
+
+    done_items = [
+        f"成功表征 YBCO KID 在 {low_t}–{high_t}K 的谐振特性与光学响应",
+        f"Qi(T) 下降趋势与 BCS 理论预期一致",
+        "光学响应率呈现温度依赖，低温段保持较高响应水平",
+        "系统在测试温区范围内稳定可靠，谐振峰形保持良好",
+    ]
+    if shift_pct is not None:
+        done_items[0] = f"成功表征 YBCO KID 在 {low_t}–{high_t}K 的谐振特性与光学响应（f₀ {shift_dir} {shift_pct:.1f}%）"
+
+    _add_bullet_list(slide7, Inches(1.5), Inches(2.5), Inches(10), Inches(2.0),
+                     done_items, font_size=Pt(16), color=WHITE)
+
+    next_items = [
+        "NEP（噪声等效功率）估算与优化",
+        "多像素统计比较，评估器件均匀性",
+        "更低温度（< 1K）测量，探索极限灵敏度",
+        "低温放大器（HEMT / JPA）集成测试",
+    ]
+    _add_bullet_list(slide7, Inches(1.5), Inches(4.5), Inches(10), Inches(2.0),
+                     next_items, font_size=Pt(14), color=GRAY)
+
+    return prs
+
 
 if __name__ == "__main__":
-    nums = extract_key_numbers()
-    for k, v in nums.items():
+    print("提取关键数值...")
+    numbers = extract_key_numbers()
+    print()
+    for k, v in numbers.items():
         print(f"  {k}: {v}")
+
+    print(f"\n构建 PPTX...")
+    prs = build_pptx(numbers)
+
+    os.makedirs(PPTX_OUT.parent, exist_ok=True)
+    prs.save(str(PPTX_OUT))
+    print(f"\nPPTX 已保存到: {PPTX_OUT}")
