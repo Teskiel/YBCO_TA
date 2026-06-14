@@ -24,7 +24,7 @@ import dataprocess as dp
 # 配置
 # ============================================================
 
-MERGED_DIR = Path(r"D:\YBCO\VNAMeas\Auto_Sweep\experiment_data\merged")
+MERGED_DIR = _script_dir.parent / "Auto_Sweep" / "experiment_data" / "merged"
 OUTPUT_DIR = _script_dir / "output" / "merged"
 PPTX_OUT = _script_dir / "output" / "YBCO_KID_merged_表征简报.pptx"
 
@@ -37,21 +37,29 @@ LASER_POWERS = [0, 1, 3, 5, 7, 9]
 # ============================================================
 
 def scan_temperatures():
-    """扫描 merged 目录下的温度点，返回排序后的列表。"""
+    """扫描 merged 目录下的温度点，返回排序后的列表（(整数温度, 原始目录名)）。"""
     pattern = re.compile(r"^(\d+(?:\.\d+)?)K$")
-    temps = []
+    entries = []
     for subfolder in MERGED_DIR.iterdir():
         if subfolder.is_dir():
             m = pattern.match(subfolder.name)
             if m:
-                temps.append(int(float(m.group(1))))
-    temps.sort()
-    return temps
+                entries.append((int(float(m.group(1))), subfolder.name))
+    if not entries:
+        raise FileNotFoundError(f"MERGED_DIR 中没有找到匹配的温度子目录: {MERGED_DIR}")
+    entries.sort(key=lambda x: x[0])
+    return entries  # list of (int_temp, dirname)
 
 
-def find_first_s2p(temp, power_dbm, laser_mw):
-    """返回指定温度/VNA功率/激光功率下的第一个 S2P 文件路径。"""
-    path = MERGED_DIR / f"{temp}K" / f"-{power_dbm}dBm" / f"{laser_mw:02d}mW"
+def find_first_s2p(temp_dirname, power_dbm, laser_mw):
+    """返回指定目录下的第一个 S2P 文件路径。
+
+    Args:
+        temp_dirname: 温度目录名（如 "6K"）
+        power_dbm: VNA 功率 (dBm 数值，取负号)
+        laser_mw: 激光功率 (mW)
+    """
+    path = MERGED_DIR / temp_dirname / f"-{power_dbm}dBm" / f"{laser_mw:02d}mW"
     if not path.is_dir():
         return None
     for f in path.iterdir():
@@ -72,19 +80,23 @@ def extract_key_numbers():
         - low_temp: 最低温度 (K)
         - high_temp: 最高温度 (K)
         - all_resonances: 所有谐振峰频率列表 (GHz)
+        - repr_low_temp: 低温代表点温度 (K) or None
+        - repr_high_temp: 高温代表点温度 (K) or None
     """
     result = {}
 
     # 扫描温度
-    temps = scan_temperatures()
+    temp_entries = scan_temperatures()
+    temps = [t for t, _ in temp_entries]
+    temp_dirs = [d for _, d in temp_entries]
     result["low_temp"] = temps[0]
     result["high_temp"] = temps[-1]
 
     # 使用最低温、-25dBm、0mW 的数据做谐振峰检测
-    s2p_path = find_first_s2p(temps[0], MEAS_POWERS[0], LASER_POWERS[0])
+    s2p_path = find_first_s2p(temp_dirs[0], MEAS_POWERS[0], LASER_POWERS[0])
     if s2p_path is None:
         raise FileNotFoundError(
-            f"找不到 S2P 文件: {temps[0]}K/-{MEAS_POWERS[0]}dBm/{LASER_POWERS[0]:02d}mW"
+            f"找不到 S2P 文件: {temp_dirs[0]}/-{MEAS_POWERS[0]}dBm/{LASER_POWERS[0]:02d}mW"
         )
 
     freq, s21 = dp.load_s_param(s2p_path)
@@ -130,15 +142,17 @@ def extract_key_numbers():
         right_idx += 1
 
     delta_f = freq[right_idx] - freq[left_idx]
-    if delta_f > 0:
-        result["qi_estimate"] = int(f0_ghz * 1e9 / delta_f)
-        result["bandwidth_mhz"] = delta_f / 1e6
-    else:
+    # Guard: reject bandwidth that spans more than half the measurement range
+    total_span = freq[-1] - freq[0]
+    if delta_f <= 0 or delta_f > total_span * 0.5:
         result["qi_estimate"] = None
         result["bandwidth_mhz"] = None
+    else:
+        result["qi_estimate"] = int(f0_ghz * 1e9 / delta_f)
+        result["bandwidth_mhz"] = delta_f / 1e6
 
     # 估算 f0 温度漂移（比较最低温和最高温的近似 f0）
-    s2p_high = find_first_s2p(temps[-1], MEAS_POWERS[0], LASER_POWERS[0])
+    s2p_high = find_first_s2p(temp_dirs[-1], MEAS_POWERS[0], LASER_POWERS[0])
     if s2p_high:
         freq_high, s21_high = dp.load_s_param(s2p_high)
         # 在高温数据中重新寻峰
