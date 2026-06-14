@@ -5,7 +5,9 @@
 将多次拆分运行的温度扫描数据合并为统一扁平目录。
 """
 
+import os
 import re
+import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,3 +131,59 @@ def resolve_conflicts(index: FragmentIndex, strategy: str = "most_complete") -> 
             mapping[key] = max(entries, key=_sort_key)
 
     return MergePlan(mapping=mapping, conflicts=conflicts)
+
+
+@dataclass
+class MergeReport:
+    """合并执行报告"""
+    total_merged: int = 0
+    conflicts_resolved: int = 0
+    hardlinks: int = 0
+    copies: int = 0
+    skipped: int = 0
+
+
+def execute_merge(
+    plan: MergePlan,
+    output_dir: Path,
+    use_hardlink: bool = True,
+    dry_run: bool = False,
+) -> MergeReport:
+    """
+    执行合并计划。
+
+    默认使用 os.link (硬链接) 节省空间，失败时 fallback 到 shutil.copy2。
+    dry_run=True 时仅打印计划不创建文件。
+    """
+    report = MergeReport(
+        total_merged=len(plan.mapping),
+        conflicts_resolved=len(plan.conflicts),
+    )
+
+    for (temp, vna_power, laser_power), entry in sorted(plan.mapping.items()):
+        dst_dir = output_dir / f"{temp}K" / f"-{vna_power}dBm" / f"{laser_power:02d}mW"
+        dst = dst_dir / entry.path.name
+
+        if dry_run:
+            report.skipped += 1
+            print(f"[DRY-RUN] {entry.path} → {dst}")
+            continue
+
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        if dst.exists():
+            report.skipped += 1
+            continue
+
+        if use_hardlink:
+            try:
+                os.link(entry.path, dst)
+                report.hardlinks += 1
+            except OSError:
+                shutil.copy2(entry.path, dst)
+                report.copies += 1
+        else:
+            shutil.copy2(entry.path, dst)
+            report.copies += 1
+
+    return report

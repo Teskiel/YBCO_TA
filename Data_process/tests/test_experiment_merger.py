@@ -147,3 +147,67 @@ class TestResolveConflicts:
         plan = em.resolve_conflicts({})
         assert plan.mapping == {}
         assert plan.conflicts == []
+
+
+class TestExecuteMerge:
+    """execute_merge() 测试"""
+
+    @pytest.fixture
+    def simple_plan(self, tmp_path):
+        """创建一个简单合并计划：单个文件"""
+        frag = tmp_path / "frag"
+        src_dir = frag / "6K" / "-25dBm" / "00mW"
+        src_dir.mkdir(parents=True)
+        src_file = src_dir / "data.s2p"
+        src_file.write_text("test data")
+        return em.MergePlan(
+            mapping={
+                (6, 25, 0): em.FileEntry(
+                    path=src_file, fragment_dir=frag,
+                    temp=6, vna_power=25, laser_power=0,
+                )
+            },
+            conflicts=[],
+        )
+
+    def test_creates_output_structure(self, simple_plan, tmp_path):
+        """合并创建正确的输出目录结构和文件"""
+        output_dir = tmp_path / "merged"
+        report = em.execute_merge(simple_plan, output_dir)
+
+        expected = output_dir / "6K" / "-25dBm" / "00mW" / "data.s2p"
+        assert expected.exists()
+        assert expected.read_text() == "test data"
+        assert report.total_merged == 1
+        assert report.conflicts_resolved == 0
+
+    def test_dry_run_no_files_created(self, simple_plan, tmp_path):
+        """dry_run 模式不创建任何文件"""
+        output_dir = tmp_path / "merged"
+        report = em.execute_merge(simple_plan, output_dir, dry_run=True)
+
+        assert not output_dir.exists()
+        assert report.skipped == 1
+
+    def test_copy_fallback_when_hardlink_fails(self, simple_plan, tmp_path, monkeypatch):
+        """硬链接失败时 fallback 到复制"""
+        # 强制 os.link 失败
+        def _fail_link(*args, **kwargs):
+            raise OSError("cross-device link")
+        monkeypatch.setattr(os, "link", _fail_link)
+
+        output_dir = tmp_path / "merged"
+        report = em.execute_merge(simple_plan, output_dir, use_hardlink=True)
+
+        assert report.copies == 1
+        assert report.hardlinks == 0
+        expected = output_dir / "6K" / "-25dBm" / "00mW" / "data.s2p"
+        assert expected.exists()
+
+    def test_use_copy_directly(self, simple_plan, tmp_path):
+        """--copy 模式直接复制"""
+        output_dir = tmp_path / "merged"
+        report = em.execute_merge(simple_plan, output_dir, use_hardlink=False)
+
+        assert report.copies == 1
+        assert report.hardlinks == 0
