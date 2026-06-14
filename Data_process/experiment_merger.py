@@ -86,3 +86,46 @@ def scan_fragments(input_dirs: List[Path]) -> FragmentIndex:
                         index[(temp, vna_power, laser_power)].append(entry)
 
     return dict(index)
+
+
+@dataclass
+class MergePlan:
+    """合并计划：每个测量组合的最终文件选择 + 冲突记录"""
+    mapping: Dict[Tuple[int, int, int], FileEntry]
+    conflicts: List[Tuple[int, int, int]]  # 存在多版本冲突的组合键
+
+
+def resolve_conflicts(index: FragmentIndex, strategy: str = "most_complete") -> MergePlan:
+    """
+    按策略去重。
+
+    most_complete 策略：
+    1. 唯一版本 → 直接选用
+    2. 多版本 → 比较所在温度下各片段的 S2P 总数，选最多的
+    3. 总数相同 → 选片段文件夹修改时间最新的
+    """
+    mapping: Dict[Tuple[int, int, int], FileEntry] = {}
+    conflicts: List[Tuple[int, int, int]] = []
+
+    # 预计算每个片段在每个温度的 S2P 总数
+    fragment_temp_counts: Dict[Tuple[Path, int], int] = defaultdict(int)
+    for entries in index.values():
+        for entry in entries:
+            fragment_temp_counts[(entry.fragment_dir, entry.temp)] += 1
+
+    for key, entries in sorted(index.items()):
+        if len(entries) == 1:
+            mapping[key] = entries[0]
+        else:
+            conflicts.append(key)
+            if strategy == "most_complete":
+                # 按 (所在温度S2P总数降序, 片段修改时间降序) 排序取最大值
+                def _sort_key(e: FileEntry) -> Tuple[int, float]:
+                    count = fragment_temp_counts.get((e.fragment_dir, e.temp), 0)
+                    mtime = e.fragment_dir.stat().st_mtime
+                    return (count, mtime)
+                mapping[key] = max(entries, key=_sort_key)
+            else:
+                raise ValueError(f"未知去重策略: {strategy}")
+
+    return MergePlan(mapping=mapping, conflicts=conflicts)

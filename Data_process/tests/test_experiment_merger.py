@@ -73,6 +73,7 @@ class TestScanFragments:
         index = em.scan_fragments([frag])
         assert len(index) == 1
         assert (6, 25, 0) in index
+        assert len(index[(6, 25, 0)]) == 1  # 仅 data.s2p, 不含 ignored.s2p
 
     def test_empty_input_returns_empty_index(self):
         """空输入列表返回空索引"""
@@ -88,3 +89,42 @@ class TestScanFragments:
 
         index = em.scan_fragments([frag, non_exist])
         assert len(index) == 1
+
+    def test_empty_fragment_dir(self, tmp_path):
+        """空的碎片目录返回空索引"""
+        frag = tmp_path / "empty_frag"
+        frag.mkdir()
+        index = em.scan_fragments([frag])
+        assert index == {}
+
+
+class TestResolveConflicts:
+    """resolve_conflicts() 测试"""
+
+    def test_most_complete_picks_larger_fragment(self, mock_two_fragments):
+        """重叠温度选 S2P 总数更多的片段"""
+        index = em.scan_fragments(mock_two_fragments)
+        plan = em.resolve_conflicts(index, strategy="most_complete")
+
+        # 6K: frag1 有 2 s2p, frag2 有 4 s2p → 应选 frag2
+        for key in [(6, 25, 0), (6, 25, 1)]:
+            assert plan.mapping[key].fragment_dir == mock_two_fragments[1]
+
+        # 8K/-25dBm/00mW: frag1 有 1 s2p(全在8K), frag2 有 4 s2p → 应选 frag2
+        assert plan.mapping[(8, 25, 0)].fragment_dir == mock_two_fragments[1]
+
+        # 确认冲突被记录
+        overlapping_keys = {(6, 25, 0), (6, 25, 1), (8, 25, 0)}
+        assert set(plan.conflicts) == overlapping_keys
+
+    def test_single_fragment_no_conflicts(self, tmp_path):
+        """单一片段无冲突"""
+        frag = tmp_path / "frag"
+        (frag / "6K" / "-25dBm" / "00mW").mkdir(parents=True)
+        (frag / "6K" / "-25dBm" / "00mW" / "d.s2p").write_text("")
+
+        index = em.scan_fragments([frag])
+        plan = em.resolve_conflicts(index, strategy="most_complete")
+
+        assert len(plan.conflicts) == 0
+        assert len(plan.mapping) == 1
