@@ -79,3 +79,64 @@ class TestBuildCompletenessMatrix:
 
         n_expected = 3 * 2 * 3  # 18
         assert int(matrix.sum()) == 18 - 1 - 3  # 14 (缺4个)
+
+
+class TestDiagnoseMissing:
+    """diagnose_missing() 测试"""
+
+    def test_classifies_isolated_edge_block(self, mock_merged_dir):
+        """分类: isolated / edge / block"""
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1, 3]
+        matrix = cc.build_completeness_matrix(
+            mock_merged_dir, temps, vna_powers, laser_powers)
+        missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
+
+        # 8K/-30dBm/01mW → isolated
+        isolated = [m for m in missing if m.category == "isolated"]
+        assert len(isolated) == 1
+        assert isolated[0].temp == 8
+        assert isolated[0].vna_power == 30
+        assert isolated[0].laser_power == 1
+
+        # 10K/-30dBm/* → block (连续3个)
+        blocks = [m for m in missing if m.category == "block"]
+        assert len(blocks) == 3
+
+    def test_edge_temperature_classified_as_edge(self, tmp_path):
+        """温度边缘缺失标记为 edge"""
+        data = tmp_path
+        # 只建 8K 的数据，6K 和 10K 完全缺失 → edge
+        for vna in [25, 30]:
+            for laser in [0, 1]:
+                d = data / "8K" / f"-{vna}dBm" / f"{laser:02d}mW"
+                d.mkdir(parents=True)
+                (d / "d.s2p").write_text("")
+
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1]
+        matrix = cc.build_completeness_matrix(data, temps, vna_powers, laser_powers)
+        missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
+
+        edges = [m for m in missing if m.category == "edge"]
+        for m in edges:
+            assert m.temp in [6, 10]
+
+    def test_complete_dataset_returns_empty(self, tmp_path):
+        """完全完整的数据返回空缺失列表"""
+        for temp in [6, 8]:
+            for vna in [25, 30]:
+                for laser in [0, 1]:
+                    d = tmp_path / f"{temp}K" / f"-{vna}dBm" / f"{laser:02d}mW"
+                    d.mkdir(parents=True)
+                    (d / "d.s2p").write_text("")
+
+        temps = [6, 8]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1]
+        matrix = cc.build_completeness_matrix(tmp_path, temps, vna_powers, laser_powers)
+        missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
+
+        assert len(missing) == 0
