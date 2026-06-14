@@ -128,3 +128,22 @@ class TestResolveConflicts:
 
         assert len(plan.conflicts) == 0
         assert len(plan.mapping) == 1
+
+    def test_unknown_strategy_raises_value_error(self, tmp_path):
+        """未知策略抛出 ValueError，无论索引是否为空"""
+        # 空索引
+        with pytest.raises(ValueError, match="未知去重策略"):
+            em.resolve_conflicts({}, strategy="bogus")
+        # 非空索引
+        frag = tmp_path / "frag"
+        (frag / "6K" / "-25dBm" / "00mW").mkdir(parents=True)
+        (frag / "6K" / "-25dBm" / "00mW" / "d.s2p").write_text("")
+        index = em.scan_fragments([frag])
+        with pytest.raises(ValueError, match="未知去重策略"):
+            em.resolve_conflicts(index, strategy="invalid")
+
+    def test_empty_index_returns_empty_plan(self):
+        """空索引返回空的 MergePlan"""
+        plan = em.resolve_conflicts({})
+        assert plan.mapping == {}
+        assert plan.conflicts == []
