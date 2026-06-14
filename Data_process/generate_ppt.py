@@ -154,7 +154,7 @@ def extract_key_numbers():
             f0_high_ghz = peaks_high[PIXEL_INDX]["frequency"] / 1e9
             shift_pct = (f0_high_ghz - f0_ghz) / f0_ghz * 100
             result["f0_shift_percent"] = abs(shift_pct)
-            result["f0_shift_direction"] = "蓝移（频率降低）" if shift_pct < 0 else "红移（频率升高）"
+            result["f0_shift_direction"] = "红移（频率降低）" if shift_pct < 0 else "蓝移（频率升高）"
         else:
             result["f0_shift_percent"] = None
             result["f0_shift_direction"] = ""
@@ -163,6 +163,8 @@ def extract_key_numbers():
         result["f0_shift_direction"] = ""
 
     # 从现有图片中推断所选的低温和高温代表点
+    result["repr_low_temp"] = None
+    result["repr_high_temp"] = None
     low_dir = OUTPUT_DIR / "05_optical_response_6K"
     high_dir = OUTPUT_DIR / "06_optical_response_highT"
     low_temp_files = [f for f in os.listdir(low_dir) if f.startswith("res shift")] if low_dir.is_dir() else []
