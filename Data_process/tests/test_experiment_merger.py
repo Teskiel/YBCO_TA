@@ -211,3 +211,29 @@ class TestExecuteMerge:
 
         assert report.copies == 1
         assert report.hardlinks == 0
+
+    def test_skip_if_destination_exists(self, simple_plan, tmp_path):
+        """目标文件已存在时跳过，计入 skipped"""
+        output_dir = tmp_path / "merged"
+        # 预创建目标文件
+        dst_dir = output_dir / "6K" / "-25dBm" / "00mW"
+        dst_dir.mkdir(parents=True)
+        existing = dst_dir / "data.s2p"
+        existing.write_text("old content")
+
+        report = em.execute_merge(simple_plan, output_dir)
+
+        assert report.skipped == 1
+        assert report.hardlinks == 0
+        assert report.copies == 0
+        # 内容未被覆盖
+        assert existing.read_text() == "old content"
+
+    def test_empty_plan_does_nothing(self, tmp_path):
+        """空的 MergePlan 不创建任何输出"""
+        plan = em.MergePlan(mapping={}, conflicts=[])
+        output_dir = tmp_path / "merged"
+        report = em.execute_merge(plan, output_dir)
+
+        assert report.total_merged == 0
+        assert not output_dir.exists()
