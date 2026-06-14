@@ -140,3 +140,82 @@ class TestDiagnoseMissing:
         missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
 
         assert len(missing) == 0
+
+
+class TestReport:
+    """报告生成和格式化测试"""
+
+    def test_generate_retest_plan(self, mock_merged_dir):
+        """补测清单按温度排序，列出所有缺失组合"""
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1, 3]
+        matrix = cc.build_completeness_matrix(
+            mock_merged_dir, temps, vna_powers, laser_powers)
+        missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
+        report = cc.build_report(matrix, temps, vna_powers, laser_powers, missing)
+
+        assert report.expected == 18
+        assert report.found == 14
+        assert report.missing == 4
+        assert report.missing_breakdown == {"isolated": 1, "edge": 0, "block": 3}
+        rp = report.retest_plan
+        assert rp.temps == [8, 10]
+        assert rp.vna_powers == [-30]
+        assert len(rp.missing_combos) == 4
+
+    def test_json_output_contains_all_sections(self, mock_merged_dir):
+        """JSON 输出包含 summary, retest_plan, details"""
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1, 3]
+        matrix = cc.build_completeness_matrix(
+            mock_merged_dir, temps, vna_powers, laser_powers)
+        missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
+        report = cc.build_report(matrix, temps, vna_powers, laser_powers, missing)
+
+        output = cc.format_report_json(report)
+        import json
+        data = json.loads(output)
+
+        assert "summary" in data
+        assert "retest_plan" in data
+        assert "details" in data
+        assert data["summary"]["expected"] == 18
+
+    def test_table_output_includes_headers(self, mock_merged_dir):
+        """table 输出包含标题行和汇总"""
+        temps = [6, 8, 10]
+        vna_powers = [25, 30]
+        laser_powers = [0, 1, 3]
+        matrix = cc.build_completeness_matrix(
+            mock_merged_dir, temps, vna_powers, laser_powers)
+        missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
+        report = cc.build_report(matrix, temps, vna_powers, laser_powers, missing)
+
+        output = cc.format_report_table(report, temps, vna_powers, laser_powers, matrix)
+
+        assert "Temperature" in output
+        assert "VNA Power" in output
+        assert "Summary:" in output
+        assert "Missing:" in output
+
+    def test_complete_dataset_table(self, tmp_path):
+        """完全完整的数据集表格输出不包含任何 ✗"""
+        for temp in [6, 8]:
+            for vna in [25]:
+                for laser in [0]:
+                    d = tmp_path / f"{temp}K" / f"-{vna}dBm" / f"{laser:02d}mW"
+                    d.mkdir(parents=True)
+                    (d / "d.s2p").write_text("")
+
+        temps = [6, 8]
+        vna_powers = [25]
+        laser_powers = [0]
+        matrix = cc.build_completeness_matrix(tmp_path, temps, vna_powers, laser_powers)
+        missing = cc.diagnose_missing(matrix, temps, vna_powers, laser_powers)
+        report = cc.build_report(matrix, temps, vna_powers, laser_powers, missing)
+
+        output = cc.format_report_table(report, temps, vna_powers, laser_powers, matrix)
+        assert "✗" not in output
+        assert "0 missing" in output

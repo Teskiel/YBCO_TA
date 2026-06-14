@@ -7,7 +7,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 import numpy as np
 
 
@@ -141,3 +141,199 @@ def diagnose_missing(
         ))
 
     return missing
+
+
+@dataclass
+class RetestPlan:
+    """补测计划"""
+    temps: List[int]
+    vna_powers: List[int]       # 负值 (原始 VNA 功率)
+    laser_powers: List[int]
+    missing_combos: List[dict]
+
+
+@dataclass
+class CompletenessReport:
+    """完整性分析报告"""
+    expected: int
+    found: int
+    missing: int
+    missing_breakdown: Dict[str, int]
+    details: List[dict]
+    retest_plan: RetestPlan
+
+
+def generate_retest_plan(missing: List[MissingPoint]) -> RetestPlan:
+    """从缺失列表生成补测计划，按温度→VNA功率→激光功率排序"""
+    if not missing:
+        return RetestPlan(temps=[], vna_powers=[], laser_powers=[], missing_combos=[])
+
+    temps = sorted(set(m.temp for m in missing))
+    vna_powers_pos = sorted(set(m.vna_power for m in missing))
+    laser_powers = sorted(set(m.laser_power for m in missing))
+
+    missing_combos = [
+        {"temp": m.temp, "vna_power": -m.vna_power, "laser_power": m.laser_power}
+        for m in sorted(missing, key=lambda m: (m.temp, m.vna_power, m.laser_power))
+    ]
+
+    return RetestPlan(
+        temps=temps,
+        vna_powers=[-v for v in vna_powers_pos],
+        laser_powers=laser_powers,
+        missing_combos=missing_combos,
+    )
+
+
+def build_report(
+    matrix: np.ndarray,
+    temps: List[int],
+    vna_powers: List[int],
+    laser_powers: List[int],
+    missing: List[MissingPoint],
+) -> CompletenessReport:
+    """组装完整报告"""
+    n_expected = len(temps) * len(vna_powers) * len(laser_powers)
+    n_found = int(matrix.sum())
+
+    breakdown: Dict[str, int] = {"isolated": 0, "edge": 0, "block": 0}
+    for m in missing:
+        breakdown[m.category] += 1
+
+    details = [
+        {
+            "temp": m.temp,
+            "vna_power": -m.vna_power,
+            "laser_power": m.laser_power,
+            "status": "missing",
+            "category": m.category,
+        }
+        for m in sorted(missing, key=lambda m: (m.temp, m.vna_power, m.laser_power))
+    ]
+
+    return CompletenessReport(
+        expected=n_expected,
+        found=n_found,
+        missing=n_expected - n_found,
+        missing_breakdown=breakdown,
+        details=details,
+        retest_plan=generate_retest_plan(missing),
+    )
+
+
+def format_report_json(report: CompletenessReport) -> str:
+    """JSON 格式输出"""
+    import json
+    return json.dumps({
+        "summary": {
+            "expected": report.expected,
+            "found": report.found,
+            "missing": report.missing,
+            "missing_breakdown": report.missing_breakdown,
+        },
+        "retest_plan": {
+            "temps": report.retest_plan.temps,
+            "vna_powers": report.retest_plan.vna_powers,
+            "laser_powers": report.retest_plan.laser_powers,
+            "missing_combos": report.retest_plan.missing_combos,
+        },
+        "details": report.details,
+    }, indent=2, ensure_ascii=False)
+
+
+def format_report_table(
+    report: CompletenessReport,
+    temps: List[int],
+    vna_powers: List[int],
+    laser_powers: List[int],
+    matrix: np.ndarray,
+) -> str:
+    """表格格式输出"""
+    lines = []
+    lines.append(f"{'Temperature':<13} {'VNA Power':<11} {'Laser Power':<13} Status")
+    lines.append("-" * 58)
+
+    for ti, temp in enumerate(temps):
+        for vi, vna in enumerate(vna_powers):
+            for li, laser in enumerate(laser_powers):
+                if matrix[ti, vi, li]:
+                    status = "✓"
+                else:
+                    cat = next(
+                        (d["category"] for d in report.details
+                         if d["temp"] == temp and d["vna_power"] == -vna
+                         and d["laser_power"] == laser),
+                        "unknown"
+                    )
+                    status = f"✗ (missing — {cat})"
+                lines.append(
+                    f"{temp}K           -{vna}dBm      {laser:02d}mW         {status}"
+                )
+
+    lines.append("-" * 58)
+    lines.append(
+        f"Summary: {report.expected} expected, {report.found} found, "
+        f"{report.missing} missing"
+    )
+    cats = ", ".join(f"{k}: {v}" for k, v in report.missing_breakdown.items())
+    lines.append(f"Missing: {cats}")
+    if report.retest_plan.temps:
+        lines.append(
+            f"Suggested retest: {len(report.retest_plan.temps)} temperature points"
+        )
+
+    return "\n".join(lines)
+
+
+def main():
+    """命令行入口：实验数据完整性检查器"""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="分析合并后数据目录的完整性，生成补测建议")
+    parser.add_argument("--input", type=Path, required=True,
+                        help="合并后的数据目录")
+    parser.add_argument("--temps-start", type=int, required=True,
+                        help="起始温度 (K)")
+    parser.add_argument("--temps-stop", type=int, required=True,
+                        help="终止温度 (K)")
+    parser.add_argument("--temps-step", type=int, required=True,
+                        help="温度步长 (K)")
+    parser.add_argument("--vna-powers", type=str, default="-25,-30,-45",
+                        help="VNA 功率列表 (默认: -25,-30,-45)")
+    parser.add_argument("--laser-powers", type=str, default="0,1,3,5,7,9",
+                        help="激光功率列表 (默认: 0,1,3,5,7,9)")
+    parser.add_argument("--format", choices=["json", "table"],
+                        default="table", help="输出格式 (默认: table)")
+    parser.add_argument("--output", type=Path,
+                        help="输出文件路径 (默认: stdout)")
+
+    args = parser.parse_args()
+
+    temps = list(range(args.temps_start, args.temps_stop + 1, args.temps_step))
+    vna_powers = [abs(int(x.strip())) for x in args.vna_powers.split(",")]
+    laser_powers = [int(x.strip()) for x in args.laser_powers.split(",")]
+
+    if not args.input.is_dir():
+        print(f"错误: 目录不存在: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
+    matrix = build_completeness_matrix(args.input, temps, vna_powers, laser_powers)
+    missing = diagnose_missing(matrix, temps, vna_powers, laser_powers)
+    report = build_report(matrix, temps, vna_powers, laser_powers, missing)
+
+    if args.format == "json":
+        output = format_report_json(report)
+    else:
+        output = format_report_table(report, temps, vna_powers, laser_powers, matrix)
+
+    if args.output:
+        args.output.write_text(output, encoding="utf-8")
+        print(f"报告已写入 {args.output}")
+    else:
+        print(output)
+
+
+if __name__ == "__main__":
+    main()
