@@ -5,9 +5,11 @@
 将多次拆分运行的温度扫描数据合并为统一扁平目录。
 """
 
+import argparse
 import os
 import re
 import shutil
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -187,3 +189,57 @@ def execute_merge(
             report.copies += 1
 
     return report
+
+
+def main():
+    """命令行入口：实验数据碎片合并引擎"""
+    parser = argparse.ArgumentParser(
+        description="合并多次拆分运行的温度扫描数据")
+    parser.add_argument("--input", nargs="+", type=Path, required=True,
+                        help="碎片文件夹路径列表")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="合并输出目录")
+    parser.add_argument("--strategy", choices=["most_complete"],
+                        default="most_complete",
+                        help="去重策略 (默认: most_complete)")
+    parser.add_argument("--copy", action="store_true",
+                        help="强制复制 (默认使用硬链接节省空间)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="仅显示合并计划，不创建文件")
+
+    args = parser.parse_args()
+
+    # 验证输入目录存在
+    for d in args.input:
+        if not d.is_dir():
+            print(f"错误: 输入目录不存在: {d}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"扫描 {len(args.input)} 个碎片文件夹...")
+    index = scan_fragments(args.input)
+    n_files = sum(len(v) for v in index.values())
+    print(f"  找到 {n_files} 个 S2P 文件，{len(index)} 个唯一 (T, Pr, Plaser) 组合")
+
+    print(f"去重 (策略: {args.strategy})...")
+    plan = resolve_conflicts(index, args.strategy)
+    print(f"  冲突: {len(plan.conflicts)} 个组合有多个版本")
+
+    print(f"合并到 {args.output}..." if not args.dry_run else "合并计划 (DRY-RUN):")
+    report = execute_merge(plan, args.output,
+                           use_hardlink=not args.copy,
+                           dry_run=args.dry_run)
+
+    if args.dry_run:
+        print(f"\n=== 合并计划 ===")
+    else:
+        print(f"\n=== 合并完成 ===")
+        print(f"  硬链接: {report.hardlinks}")
+        print(f"  复制:   {report.copies}")
+    print(f"  总文件: {report.total_merged}")
+    print(f"  冲突:   {report.conflicts_resolved}")
+    if report.skipped:
+        print(f"  跳过:   {report.skipped}")
+
+
+if __name__ == "__main__":
+    main()

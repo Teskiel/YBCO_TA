@@ -237,3 +237,32 @@ class TestExecuteMerge:
 
         assert report.total_merged == 0
         assert not output_dir.exists()
+
+
+class TestPipeline:
+    """集成测试：scan → resolve → execute 完整管线"""
+
+    def test_dry_run_pipeline(self, mock_two_fragments, tmp_path):
+        """dry-run 完整管线：不创建文件"""
+        output_dir = tmp_path / "merged"
+        index = em.scan_fragments(mock_two_fragments)
+        plan = em.resolve_conflicts(index, "most_complete")
+        report = em.execute_merge(plan, output_dir, dry_run=True)
+
+        assert not output_dir.exists()
+        assert report.total_merged == 8
+        assert len(plan.conflicts) == 3
+
+    def test_real_merge_pipeline(self, mock_two_fragments, tmp_path):
+        """真实合并：创建正确的输出结构"""
+        output_dir = tmp_path / "merged"
+        index = em.scan_fragments(mock_two_fragments)
+        plan = em.resolve_conflicts(index, "most_complete")
+        report = em.execute_merge(plan, output_dir)
+
+        assert output_dir.is_dir()
+        assert (output_dir / "6K" / "-25dBm" / "00mW").is_dir()
+        assert report.total_merged == 8
+        # 验证合并的文件内容可读
+        s2p_files = list(output_dir.rglob("*.s2p"))
+        assert len(s2p_files) == 8
