@@ -816,6 +816,9 @@ class ExperimentWorker(QObject):
         # Claude 主动监控
         self._status_writer = None
         self._meltdown_threshold_k = 0.25  # 默认值，configure 中覆盖
+        self._drift_meltdown_count = 0        # 当前温度点漂移熔断计数
+        self._settling_multiplier = 1.0       # 沉降倍率（1.0 = 默认）
+        self._in_retry_mode = False           # 是否处于复测模式
 
     def configure(
         self,
@@ -846,6 +849,10 @@ class ExperimentWorker(QObject):
         self._max_wait_s = max_wait_s if max_wait_s is not None else config.max_wait_seconds
         self._meltdown_threshold_k = getattr(
             config, "inter_measurement_max_delta_k", 0.25)
+        # 自适应熔断实例变量（每个温度点重置）
+        self._drift_meltdown_count = 0
+        self._settling_multiplier = 1.0
+        self._in_retry_mode = False
 
     @pyqtSlot()
     def abort(self):
@@ -1945,6 +1952,9 @@ class ExperimentWorker(QObject):
 
                 # 测量重启循环（不限次数，由 max_wait 超时终止）
                 measurement_restarts = 0
+                self._drift_meltdown_count = 0   # 每个温度点重置
+                self._settling_multiplier = 1.0
+                self._in_retry_mode = False
                 self._laser_was_off = True   # Fix 3: 每个温度点初始时激光关闭
                 while True:
                     # 需求 A: 超时硬失败 → 跳过此温度点所有测量
@@ -2101,11 +2111,11 @@ class ExperimentWorker(QObject):
                             if len(measurement_temps) >= 2:
                                 temp_range = (max(measurement_temps)
                                               - min(measurement_temps))
-                                if temp_range > config.inter_measurement_max_delta_k:
+                                if temp_range > self._meltdown_threshold_k:
                                     _log(
                                         f"  ⛔ 测量中温度漂移熔断: "
                                         f"max-min={temp_range:.3f}K "
-                                        f"> {config.inter_measurement_max_delta_k}K, "
+                                        f"> {self._meltdown_threshold_k}K, "
                                         f"读数="
                                         f"{[f'{t:.3f}' for t in measurement_temps]}")
                                     # Claude 监控: 记录熔断
