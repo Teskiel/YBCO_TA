@@ -2279,11 +2279,21 @@ class ExperimentWorker(QObject):
                         # 测量全部通过
                         break
 
-                    # Fix 2: 熔断重启上限检查
-                    if measurement_restarts >= config.max_meltdown_restarts:
+                    # Fix 2: 熔断重启上限检查（复测模式感知）
+                    _skip_now = False
+                    if self._in_retry_mode:
+                        retry_meltdowns = (self._drift_meltdown_count
+                                           - config.max_meltdown_restarts)
+                        if retry_meltdowns > config.retry_mode_max_meltdowns:
+                            _log(f"  ⛔ 复测熔断已达上限，跳过温度点 {target_k:.1f}K")
+                            _skip_now = True
+                    elif measurement_restarts >= config.max_meltdown_restarts:
                         _log(f"  ⛔ 熔断重启已达上限 "
                              f"({measurement_restarts}/{config.max_meltdown_restarts})，"
                              f"跳过温度点 {target_k:.1f}K")
+                        _skip_now = True
+
+                    if _skip_now:
                         # Claude 监控: 记录跳过
                         try:
                             if self._status_writer:
