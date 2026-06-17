@@ -147,6 +147,12 @@ sparse_max_wait_seconds = 90 * 60      # SPARSE 阶段最长等待 (90 min)
 
 inter_measurement_max_delta_k = 0.25   # 同温度下任意两次测量 pre_temp 差 > 0.25K → 熔断
 max_meltdown_restarts = 3                 # 同温度点熔断重启上限，超限跳过此温度点
+
+# 测量中漂移熔断自适应
+meltdown_settling_multipliers = [8, 15]   # 第1次×8, 第2次×15
+meltdown_relaxed_threshold_k = 0.45       # 第2次放宽后的阈值
+retry_mode_max_meltdowns = 2              # 复测模式额外熔断次数
+
 laser_on_temp_tolerance_k = 1.0          # 激光加热时放宽的测量后容差 (K)
 
 # =========================================================================
