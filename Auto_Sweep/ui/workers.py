@@ -1736,6 +1736,9 @@ class ExperimentWorker(QObject):
                 else:
                     _log(f"→ Stabilising to {target_k:.1f} K ...")
 
+                # Claude 监控: 开始稳定前先轮询命令
+                self._poll_commands()
+
                 # ---- 读取当前温度 ----
                 actual_k = target_k
                 try:
@@ -1817,6 +1820,9 @@ class ExperimentWorker(QObject):
                         if prev_phase == "fine":
                             _log(f"  进入 Phase 2（趋于平稳），提高轮询频率至 "
                                  f"{config.fine_poll_seconds}s，并行判目标区间+稳态")
+                            self._write_status(
+                                phase="stabilizing_fine", target_k=target_k,
+                                actual_k=actual_k)
 
                     # 检查是否需要调整设定点过冲
                     new_sp = stability_ctrl.needs_setpoint_adjustment()
@@ -1834,12 +1840,18 @@ class ExperimentWorker(QObject):
                         _log(f"  稳定: {actual_k:.3f} K "
                              f"(target {target_k:.1f} K, "
                              f"phase={stability_ctrl.phase.value})")
+                        self._write_status(
+                            phase="pre_measuring", target_k=target_k,
+                            actual_k=actual_k)
                         break
                     elif result.reason == "good_enough":
                         _log(f"  good_enough — "
                              f"avg={result.avg_temp:.3f}K vs "
                              f"target={target_k:.1f}K "
                              f"(phase={stability_ctrl.phase.value})，继续测量")
+                        self._write_status(
+                            phase="pre_measuring", target_k=target_k,
+                            actual_k=actual_k)
                         self.temperature_stable.emit(target_k, actual_k)
                         break
                     elif result.reason == "timeout":
@@ -1938,6 +1950,16 @@ class ExperimentWorker(QObject):
                     # 需求 A: 超时硬失败 → 跳过此温度点所有测量
                     if _temp_skip_measurement:
                         _log(f"  跳过温度点 {target_k:.1f}K（超时硬失败）")
+                        # Claude 监控: 记录跳过
+                        try:
+                            if self._status_writer:
+                                self._status_writer.add_skipped(
+                                    target_k=target_k,
+                                    reason="timeout_hard_fail",
+                                    vna_power_remaining=self._vna_power_list,
+                                )
+                        except Exception:
+                            pass
                         break
 
                     # ---- 预测量等待（仅首次测量循环） ----
@@ -2068,6 +2090,11 @@ class ExperimentWorker(QObject):
                             self.measurement_started.emit(pre_temp, power_mw)
                             _log(f"  Measuring {vna_dbm:+d} dBm / "
                                  f"{power_mw} mW @ {pre_temp:.3f} K")
+                            # Claude 监控: 测量开始
+                            self._write_status(
+                                phase="measuring", target_k=target_k,
+                                actual_k=pre_temp, vna_dbm=vna_dbm,
+                                laser_mw=power_mw)
                             measurement_temps.append(pre_temp)
 
                             # ---- ΔT 熔断检查: 任意两次测量 pre_temp 差 > 0.25K ----
@@ -2081,6 +2108,20 @@ class ExperimentWorker(QObject):
                                         f"> {config.inter_measurement_max_delta_k}K, "
                                         f"读数="
                                         f"{[f'{t:.3f}' for t in measurement_temps]}")
+                                    # Claude 监控: 记录熔断
+                                    self._write_status(
+                                        phase="meltdown_recovery",
+                                        target_k=target_k, actual_k=pre_temp)
+                                    try:
+                                        if self._status_writer:
+                                            self._status_writer.add_issue(
+                                                target_k=target_k,
+                                                issue_type="meltdown",
+                                                detail=f"max-min={temp_range:.3f}K",
+                                                restart_count=measurement_restarts + 1,
+                                            )
+                                    except Exception:
+                                        pass
                                     # 将当前文件移至 discarded/
                                     discarded_dir = os.path.join(
                                         self._output_dir, temp_str, "discarded")
@@ -2200,6 +2241,16 @@ class ExperimentWorker(QObject):
                         _log(f"  ⛔ 熔断重启已达上限 "
                              f"({measurement_restarts}/{config.max_meltdown_restarts})，"
                              f"跳过温度点 {target_k:.1f}K")
+                        # Claude 监控: 记录跳过
+                        try:
+                            if self._status_writer:
+                                self._status_writer.add_skipped(
+                                    target_k=target_k,
+                                    reason="meltdown_limit",
+                                    vna_power_remaining=self._vna_power_list,
+                                )
+                        except Exception:
+                            pass
                         # 确保激光已关闭再跳至下一温度点
                         if self._laser_ctrl:
                             try:
@@ -2334,6 +2385,13 @@ class ExperimentWorker(QObject):
             # ================================================================
             end_time = datetime.now()
             _log(f"Experiment complete — {count} measurements")
+
+            # Claude 监控: 标记实验完成
+            try:
+                if self._status_writer:
+                    self._status_writer.set_status("completed")
+            except Exception:
+                pass
 
             # ---- 保存 overshoot 学习数据到 app_settings.json ----
             if _overshoot_learning:
