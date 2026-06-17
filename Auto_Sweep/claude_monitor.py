@@ -14,10 +14,13 @@ Claude Code 侧实验监控脚本
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from typing import List, Set
+
+import config
 
 # Windows GBK 控制台兼容：强制 stdout/stderr 使用 utf-8
 if sys.platform == "win32":
@@ -75,8 +78,8 @@ def analyze_for_intervention(issues: list, skipped_list: list,
         if count >= 2 and "relax_meltdown" not in existing_actions:
             commands.append({
                 "action": "relax_meltdown",
-                "params": {"new_threshold_k": 0.35, "target_k": temp_k},
-                "reason": f"{temp_k}K 已熔断 {count} 次，临时放宽阈值至 0.35K",
+                "params": {"new_threshold_k": 0.45, "target_k": temp_k},
+                "reason": f"{temp_k}K 已熔断 {count} 次，临时放宽阈值至 0.45K",
             })
             break  # 一条命令即可
 
@@ -136,6 +139,100 @@ def _write_commands(output_dir: str, new_commands: list):
     os.makedirs(output_dir, exist_ok=True)
     with open(cmd_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+# =========================================================================
+# 自动发现活跃实验
+# =========================================================================
+
+_EXP_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
+
+# 默认过期阈值：30 分钟（覆盖测量阶段长时间无 phase 切换的情况）
+_DEFAULT_STALE_TIMEOUT_S = 1800
+
+
+def _discover_active_experiments(base_dir: str,
+                                  stale_timeout_s: int = _DEFAULT_STALE_TIMEOUT_S) -> list[str]:
+    """扫描 base_dir 下所有实验目录，返回活跃实验的绝对路径列表。
+
+    双重信号判定：
+      1. 主信号 status.json → "status": "running" + last_update 未超时
+      2. 备用信号 heartbeat.json → stop != true + step_ts 未超时
+
+    超时实验输出 stderr 警告，但不作为活跃实验返回。
+    返回按最后更新时间倒序排列的目录路径列表。
+    """
+    if not os.path.isdir(base_dir):
+        return []
+
+    active = []
+    stale = []
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    for entry_name in os.listdir(base_dir):
+        if not _EXP_DIR_RE.match(entry_name):
+            continue
+        exp_dir = os.path.join(base_dir, entry_name)
+        if not os.path.isdir(exp_dir):
+            continue
+
+        # 主信号: status.json
+        status_path = os.path.join(exp_dir, "status.json")
+        status_active = False
+        last_update_ts = 0.0
+        if os.path.exists(status_path):
+            try:
+                with open(status_path, "r", encoding="utf-8") as f:
+                    status_data = json.load(f)
+                if status_data.get("status") == "running":
+                    status_active = True
+                    lu = status_data.get("last_update", "")
+                    if lu:
+                        try:
+                            dt = datetime.fromisoformat(lu)
+                            # 兼容不带时区标记的旧格式（视为 UTC）
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            last_update_ts = dt.timestamp()
+                        except (ValueError, OSError):
+                            pass
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # 备用信号: heartbeat.json
+        heartbeat_path = os.path.join(exp_dir, "heartbeat.json")
+        heartbeat_active = False
+        if os.path.exists(heartbeat_path):
+            try:
+                with open(heartbeat_path, "r", encoding="utf-8") as f:
+                    hb_data = json.load(f)
+                if not hb_data.get("stop", False):
+                    step_ts = hb_data.get("step_ts", 0)
+                    if now_ts - step_ts < stale_timeout_s:
+                        heartbeat_active = True
+                        if step_ts > last_update_ts:
+                            last_update_ts = step_ts
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if status_active or heartbeat_active:
+            age_s = now_ts - last_update_ts if last_update_ts else 0
+            if age_s < stale_timeout_s:
+                active.append((exp_dir, last_update_ts))
+            else:
+                stale.append((exp_dir, age_s))
+
+    # 报告疑似挂死的实验（不阻塞）
+    for exp_dir, age_s in stale:
+        print(
+            f"[警告] {os.path.basename(exp_dir)} 可能已挂死 "
+            f"({int(age_s // 60)} 分钟未更新)",
+            file=sys.stderr,
+        )
+
+    # 按最新活跃优先排序
+    active.sort(key=lambda x: x[1], reverse=True)
+    return [d for d, _ in active]
 
 
 def _cmd_check(output_dir: str):
@@ -293,7 +390,6 @@ def _cmd_fill_plan(output_dir: str):
         print(f"   {t}K  {v:+d} dBm  缺 {len(powers)} 个激光功率: {sorted(powers)}")
 
     # 生成补测计划
-    import config
     plan_path = generate_fill_plan(
         missing=missing,
         experiment_id=status["experiment_id"],
@@ -312,6 +408,102 @@ def _cmd_fill_plan(output_dir: str):
 
 
 # =========================================================================
+# --auto 模式入口
+# =========================================================================
+
+def _discover_completed_unchecked(base_dir: str,
+                                   max_age_hours: int = 24) -> list[str]:
+    """扫描 base_dir 下已完成但尚未做完整性检查的实验。
+
+    条件：status.json 中 status="completed" 且该目录下无 fill_plan.json。
+    仅返回最近 max_age_hours 内完成的实验，避免反复处理历史数据。
+    """
+    if not os.path.isdir(base_dir):
+        return []
+
+    unchecked = []
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    for entry_name in os.listdir(base_dir):
+        if not _EXP_DIR_RE.match(entry_name):
+            continue
+        exp_dir = os.path.join(base_dir, entry_name)
+        if not os.path.isdir(exp_dir):
+            continue
+
+        # 已有 fill_plan.json 或 fill_complete.json → 跳过
+        if os.path.exists(os.path.join(exp_dir, "fill_plan.json")):
+            continue
+        if os.path.exists(os.path.join(exp_dir, "fill_complete.json")):
+            continue
+
+        # 检查 status.json
+        status_path = os.path.join(exp_dir, "status.json")
+        if not os.path.exists(status_path):
+            continue
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                status_data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        if status_data.get("status") != "completed":
+            continue
+
+        # 检查完成时间是否在 max_age_hours 内
+        lu = status_data.get("last_update", "")
+        if lu:
+            try:
+                dt = datetime.fromisoformat(lu)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                age_hours = (now_ts - dt.timestamp()) / 3600
+                if age_hours > max_age_hours:
+                    continue
+            except (ValueError, OSError):
+                pass
+
+        unchecked.append((exp_dir, lu))
+
+    unchecked.sort(key=lambda x: x[1], reverse=True)
+    return [d for d, _ in unchecked]
+
+
+def _cmd_auto(base_dir: str, action: str = "check",
+               stale_timeout_s: int = _DEFAULT_STALE_TIMEOUT_S):
+    """扫描 base_dir 寻找活跃实验并执行 action。
+
+    每轮同时检查：
+      - 活跃实验（running）→ 状态摘要 + 干预
+      - 已完成实验（completed）且无 fill_plan → 自动生成补测计划
+    """
+    exp_dirs = _discover_active_experiments(base_dir, stale_timeout_s)
+    completed_unchecked = _discover_completed_unchecked(base_dir)
+
+    if not exp_dirs and not completed_unchecked:
+        print("-- 当前没有活跃的实验 --")
+        return
+
+    # 活跃实验 → 状态 + 干预
+    if exp_dirs:
+        print(f"-- 发现 {len(exp_dirs)} 个活跃实验 --")
+        for exp_dir in exp_dirs:
+            exp_name = os.path.basename(exp_dir)
+            print(f"\n  [{exp_name}]")
+            _cmd_check(exp_dir)
+            if action in ("intervene",):
+                _cmd_intervene(exp_dir)
+
+    # 已完成但未做完整性检查 → 自动补测分析
+    if completed_unchecked:
+        print(f"\n-- 发现 {len(completed_unchecked)} 个已完成但未做完整性检查的实验 --")
+        for exp_dir in completed_unchecked:
+            exp_name = os.path.basename(exp_dir)
+            print(f"\n  [{exp_name}] 自动补测分析:")
+            _cmd_fill_plan(exp_dir)
+
+
+# =========================================================================
 # CLI 入口
 # =========================================================================
 
@@ -319,8 +511,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Claude Code 实验监控脚本",
     )
-    parser.add_argument("--dir", type=str, required=True,
-                        help="实验输出目录路径")
+    parser.add_argument("--dir", type=str, required=False, default=None,
+                        help="实验输出目录路径（--auto 模式下可不提供）")
+    parser.add_argument("--auto", action="store_true",
+                        help="自动发现活跃实验（扫描 experiment_data/）")
+    parser.add_argument("--base", type=str, default=None,
+                        help="实验数据根目录（默认: config.experiment_data_base_dir）")
+    parser.add_argument("--stale-timeout", type=int, default=_DEFAULT_STALE_TIMEOUT_S,
+                        help=f"实验视为挂死的超时秒数（默认 {_DEFAULT_STALE_TIMEOUT_S}）")
     parser.add_argument("--check", action="store_true",
                         help="状态摘要")
     parser.add_argument("--report", action="store_true",
@@ -333,18 +531,36 @@ def main():
 
     args = parser.parse_args()
 
+    # --auto 模式：自动发现 + 执行
+    if args.auto:
+        base = args.base or config.experiment_data_base_dir
+        # 确定 action 优先级: intervene > fill_plan > report > check (默认)
+        if args.intervene:
+            action = "intervene"
+        elif args.fill_plan:
+            action = "fill_plan"
+        elif args.report:
+            action = "report"
+        else:
+            action = "intervene"  # 默认：检查 + 干预 + 完成时补测
+        _cmd_auto(base, action, args.stale_timeout)
+        return
+
+    # 传统 --dir 模式（向后兼容）
+    if not args.dir:
+        print("[错误] 需要 --dir 或 --auto 参数", file=sys.stderr)
+        sys.exit(1)
+
     if not os.path.isdir(args.dir):
         print(f"[错误] 目录不存在: {args.dir}", file=sys.stderr)
         sys.exit(1)
 
-    if args.check:
-        _cmd_check(args.dir)
-    elif args.report:
-        _cmd_report(args.dir)
-    elif args.intervene:
+    if args.intervene:
         _cmd_intervene(args.dir)
     elif args.fill_plan:
         _cmd_fill_plan(args.dir)
+    elif args.report:
+        _cmd_report(args.dir)
     else:
         # 默认行为：等同于 --check
         _cmd_check(args.dir)
