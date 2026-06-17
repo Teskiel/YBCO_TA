@@ -377,6 +377,13 @@ def _cmd_fill_plan(output_dir: str):
 
     if not missing:
         print("✅ 数据完整，无需补测。")
+        # 写入 fill_complete.json 避免重复扫描
+        fc_path = os.path.join(output_dir, "fill_complete.json")
+        try:
+            with open(fc_path, "w", encoding="utf-8") as f:
+                json.dump({"status": "complete", "missing": 0}, f)
+        except OSError:
+            pass
         return
 
     print(f"🔍 缺失 {len(missing)} 个测量点:")
