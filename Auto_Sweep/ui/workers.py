@@ -2145,6 +2145,38 @@ class ExperimentWorker(QObject):
                                             f"discarded/{filename}")
                                     # 放弃本轮所有已测数据，触发重启
                                     measurement_ok = False
+                                    # ---- 自适应参数调整 ----
+                                    self._drift_meltdown_count += 1
+                                    if self._drift_meltdown_count == 1:
+                                        self._settling_multiplier = float(
+                                            config.meltdown_settling_multipliers[0])
+                                        _log(
+                                            f"  🔧 熔断 #{measurement_restarts + 1}"
+                                            f" → 沉降时间 ×"
+                                            f"{self._settling_multiplier:.0f}"
+                                            f"（激光 {config.laser_settle_time_s * self._settling_multiplier:.0f}s"
+                                            f" / 首次上电 {config.laser_first_on_settle_time_s * self._settling_multiplier:.0f}s）")
+                                    elif self._drift_meltdown_count == 2:
+                                        self._settling_multiplier = float(
+                                            config.meltdown_settling_multipliers[1])
+                                        self._meltdown_threshold_k = \
+                                            config.meltdown_relaxed_threshold_k
+                                        _log(
+                                            f"  🔧 熔断 #{measurement_restarts + 1}"
+                                            f" → 沉降时间 ×"
+                                            f"{self._settling_multiplier:.0f}"
+                                            f" + 阈值放宽至 "
+                                            f"{self._meltdown_threshold_k}K")
+                                    elif self._drift_meltdown_count == 3:
+                                        _log(
+                                            f"  🔧 熔断 #{measurement_restarts + 1}"
+                                            f" → 进入复测模式（重测所有 VNA×laser）")
+                                        self._in_retry_mode = True
+                                    elif self._drift_meltdown_count > 3:
+                                        _log(
+                                            f"  🔧 复测熔断 "
+                                            f"(#{self._drift_meltdown_count - 3}"
+                                            f"/{config.retry_mode_max_meltdowns})")
                                     deleted_any = True
                                     break  # 跳出激光功率循环
 
@@ -2162,6 +2194,7 @@ class ExperimentWorker(QObject):
                                 settle_s = (config.laser_first_on_settle_time_s
                                             if laser_was_off and power_mw > 0
                                             else config.laser_settle_time_s)
+                                settle_s = settle_s * self._settling_multiplier
                                 _time.sleep(settle_s)
                                 # 沉降后读取并记录温度，方便诊断激光加热效应
                                 try:
