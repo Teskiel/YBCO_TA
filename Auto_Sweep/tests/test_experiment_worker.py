@@ -1701,3 +1701,318 @@ class TestExperimentRecovery:
             assert len(resume_prompts) == 1
             assert resume_prompts[0][0] == "20260612_test"
             assert resume_prompts[0][1] == 1  # 1 completed point
+
+
+# =========================================================================
+# Phase 5: Claude 主动监控 — _write_status, _poll_commands, _run_fill
+# =========================================================================
+
+
+class TestExperimentStatusIntegration:
+    """Given an ExperimentWorker, _write_status writes status.json correctly."""
+
+    def test_given_configured_worker_when_write_status_called_then_status_json_exists(
+        self, qapp
+    ):
+        """_write_status() 应创建 status.json 文件。"""
+        import json, tempfile
+        from ui.workers import ExperimentWorker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                temp_list=[30.0, 50.0],
+                power_list=[0, 5],
+                output_dir=tmpdir,
+            )
+            worker._write_status(phase="starting", target_k=30.0)
+
+            path = os.path.join(tmpdir, "status.json")
+            assert os.path.exists(path), "status.json 应该被创建"
+
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            assert data["status"] == "running"
+            assert data["current"]["phase"] == "starting"
+
+    def test_given_worker_running_when_write_status_on_stable_then_phase_updated(
+        self, qapp
+    ):
+        """稳定达成后 _write_status 应更新 phase 为 stabilizing_fine。"""
+        import json, tempfile
+        from ui.workers import ExperimentWorker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                temp_list=[30.0],
+                power_list=[0],
+                output_dir=tmpdir,
+            )
+            worker._write_status(phase="stabilizing_sparse", target_k=30.0, actual_k=29.5)
+            worker._write_status(phase="stabilizing_fine", target_k=30.0, actual_k=30.002)
+
+            path = os.path.join(tmpdir, "status.json")
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            assert data["current"]["phase"] == "stabilizing_fine"
+
+    def test_given_write_status_called_on_measurement_then_phase_measuring(
+        self, qapp
+    ):
+        """测量开始时 _write_status 应设置 phase=measuring。"""
+        import json, tempfile
+        from ui.workers import ExperimentWorker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                temp_list=[30.0],
+                power_list=[0],
+                output_dir=tmpdir,
+            )
+            worker._write_status(
+                phase="measuring", target_k=30.0, actual_k=30.002,
+                vna_dbm=-45, laser_mw=0,
+            )
+
+            path = os.path.join(tmpdir, "status.json")
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            assert data["current"]["phase"] == "measuring"
+            assert data["current"]["vna_dbm"] == -45
+
+    def test_given_write_status_without_output_dir_then_no_error(self, qapp):
+        """output_dir 为空时 _write_status 不应抛异常（静默跳过）。"""
+        worker = _build_worker(
+            temp_list=[30.0],
+            power_list=[0],
+            output_dir="",  # 空目录
+        )
+        # 不应抛异常
+        try:
+            worker._write_status(phase="starting", target_k=30.0)
+        except Exception as e:
+            pytest.fail(f"_write_status 不应抛出异常: {e}")
+
+
+class TestCommandPolling:
+    """Given an ExperimentWorker, _poll_commands reads and applies commands.json."""
+
+    def test_given_pending_extend_max_wait_when_polled_then_max_wait_increased(
+        self, qapp
+    ):
+        """extend_max_wait 命令应增加 max_wait_seconds。"""
+        import json, tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                temp_list=[30.0],
+                power_list=[0],
+                output_dir=tmpdir,
+            )
+            original = worker._max_wait_s
+
+            # 预写入命令
+            cmd = {
+                "last_command_id": "cmd_001",
+                "commands": [{
+                    "id": "cmd_001",
+                    "time": "2026-06-16T11:50:00",
+                    "action": "extend_max_wait",
+                    "params": {"add_minutes": 30},
+                    "reason": "测试",
+                    "status": "pending",
+                }],
+            }
+            with open(os.path.join(tmpdir, "commands.json"), "w", encoding="utf-8") as f:
+                json.dump(cmd, f, ensure_ascii=False)
+
+            worker._poll_commands()
+
+            assert worker._max_wait_s == original + 30 * 60
+
+            # 验证命令已标记 applied
+            with open(os.path.join(tmpdir, "commands.json"), "r", encoding="utf-8") as f:
+                updated = json.load(f)
+            assert updated["commands"][0]["status"] == "applied"
+
+    def test_given_relax_meltdown_command_when_polled_then_threshold_updated(
+        self, qapp
+    ):
+        """relax_meltdown 命令应更新熔断阈值。"""
+        import json, tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                temp_list=[30.0],
+                power_list=[0],
+                output_dir=tmpdir,
+            )
+            cmd = {
+                "last_command_id": "cmd_001",
+                "commands": [{
+                    "id": "cmd_001",
+                    "time": "2026-06-16T12:40:00",
+                    "action": "relax_meltdown",
+                    "params": {"new_threshold_k": 0.35},
+                    "reason": "测试",
+                    "status": "pending",
+                }],
+            }
+            with open(os.path.join(tmpdir, "commands.json"), "w", encoding="utf-8") as f:
+                json.dump(cmd, f, ensure_ascii=False)
+
+            worker._poll_commands()
+
+            import config
+            assert worker._meltdown_threshold_k == 0.35
+
+    def test_given_no_commands_file_when_polled_then_no_error(self, qapp):
+        """commands.json 不存在时 _poll_commands 不应出错。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                temp_list=[30.0],
+                power_list=[0],
+                output_dir=tmpdir,
+            )
+            # 不应抛异常
+            try:
+                worker._poll_commands()
+            except Exception as e:
+                pytest.fail(f"_poll_commands 不应抛出异常: {e}")
+
+    def test_given_already_applied_command_when_polled_then_not_reapplied(
+        self, qapp
+    ):
+        """已 applied 的命令不应重复执行。"""
+        import json, tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(temp_list=[30.0], power_list=[0], output_dir=tmpdir)
+            original = worker._max_wait_s
+
+            cmd = {
+                "last_command_id": "cmd_001",
+                "commands": [{
+                    "id": "cmd_001",
+                    "action": "extend_max_wait",
+                    "params": {"add_minutes": 30},
+                    "status": "applied",  # 已应用
+                }],
+            }
+            with open(os.path.join(tmpdir, "commands.json"), "w", encoding="utf-8") as f:
+                json.dump(cmd, f, ensure_ascii=False)
+
+            worker._poll_commands()
+            # 不应再次增加
+            assert worker._max_wait_s == original
+
+
+class TestFillMode:
+    """Given ExperimentWorker in fill mode, _run_fill executes cooldown+measure."""
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_fill_plan_when_run_fill_called_then_cooling_setpoint_set(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """补测模式应首先设置冷却 setpoint = target - offset。"""
+        import json, tempfile
+        import config as cfg
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 创建 fill_plan.json
+            plan_path = os.path.join(tmpdir, "fill_plan.json")
+            plan = {
+                "experiment_id": "fill_test",
+                "strategy": "cooldown_then_heat",
+                "cooldown_offset_k": 5.0,
+                "temperature_plan": [50.0],
+                "measurements": [{
+                    "target_k": 50.0,
+                    "vna_dbm": -25,
+                    "laser_powers_mw": [0, 5],
+                }],
+            }
+            with open(plan_path, "w", encoding="utf-8") as f:
+                json.dump(plan, f)
+
+            ls = _make_mock_lakeshore(start_temp=55.0)
+            # 模拟冷却过程：第三次调用时温度低于目标
+            ls.get_temperature.side_effect = [55.0, 51.0, 49.5, 49.5, 49.5, 49.5]
+            worker = _build_worker(
+                lakeshore=ls, temp_list=[50.0], power_list=[0],
+                output_dir=tmpdir,
+            )
+            worker._run_fill(tmpdir)
+
+            # 验证 setpoint 被设为 target - offset
+            setpoint_calls = [c for c in ls.set_temperature.call_args_list
+                              if c[0][0] is not None]
+            assert len(setpoint_calls) > 0, "应该有 setpoint 设置调用"
+            first_setpoint = setpoint_calls[0][0][0]
+            assert abs(first_setpoint - 45.0) < 0.1, (
+                f"冷却 setpoint 应为 target-5K=45K, 实际 {first_setpoint}"
+            )
+
+    def test_given_fill_plan_when_fill_complete_then_writes_fill_complete_json(
+        self, qapp
+    ):
+        """补测完成后应写入 fill_complete.json。"""
+        import json, tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                temp_list=[30.0], power_list=[0],
+                output_dir=tmpdir,
+            )
+            worker._write_fill_complete(tmpdir, 2, 2)
+
+            path = os.path.join(tmpdir, "fill_complete.json")
+            assert os.path.exists(path)
+
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            assert data["total_measured"] == 2
+            assert data["total_expected"] == 2
+            assert data["completeness"] == 1.0
+
+
+class TestFillModeNoExistingFile:
+    """Backward compatibility: no fill artifacts when not in fill mode."""
+
+    @patch("time.sleep", return_value=None)
+    @patch("os.makedirs")
+    def test_given_normal_run_when_no_fill_flag_then_no_fill_plan_consumed(
+        self, mock_makedirs, mock_sleep, qapp
+    ):
+        """正常实验运行时不应读取 fill_plan.json。"""
+        import tempfile
+
+        ls = _make_mock_lakeshore(start_temp=30.0)
+        ls.get_temperature.return_value = 30.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            worker = _build_worker(
+                lakeshore=ls, temp_list=[30.0], power_list=[0],
+                output_dir=tmpdir,
+            )
+
+            with patch(
+                "ui.experiment_stability_controller.ExperimentStabilityController"
+            ) as mock_ctrl_cls:
+                mock_ctrl = mock_ctrl_cls.return_value
+                mock_ctrl.get_fixed_pid.return_value = {"p": 100, "i": 0, "d": 0}
+                mock_ctrl.setup.return_value = None
+                mock_ctrl.add_reading.return_value = None
+                mock_ctrl.check.return_value = MagicMock(
+                    stable=True, reason="stable", avg_temp=30.0)
+                mock_ctrl.needs_setpoint_adjustment.return_value = None
+                mock_ctrl.base_overshoot = 1.5
+                mock_ctrl.current_overshoot = 1.5
+
+                # 不应该因为缺失 fill_plan.json 而报错
+                try:
+                    worker.run()
+                except Exception as e:
+                    pytest.fail(f"正常 run() 不应因 fill 逻辑而失败: {e}")

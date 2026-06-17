@@ -15,7 +15,7 @@ import os
 import time
 from typing import Optional
 
-from PyQt5.QtCore import QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QMainWindow, QStackedWidget, QMessageBox
 
 from ui.dashboard_page import DashboardPage
@@ -34,8 +34,10 @@ def _ts() -> str:
 
 class MainWindow(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, resume_path: str = None, fill_path: str = None):
         super().__init__()
+        self._resume_path = resume_path
+        self._fill_path = fill_path
         self.setWindowTitle("YBCO Auto Sweep Control")
         self.resize(1000, 820)
 
@@ -105,6 +107,10 @@ class MainWindow(QMainWindow):
 
         # start on dashboard
         self.stack.setCurrentIndex(0)
+
+        # 如果指定了 resume_path，延迟自动恢复实验
+        if self._resume_path:
+            QTimer.singleShot(500, self._auto_resume_experiment)
 
     # ==================================================================
     # Settings auto-persist (replaces manual preset system)
@@ -556,6 +562,8 @@ class MainWindow(QMainWindow):
         self.experiment_thread = QThread()
         self.experiment_worker.moveToThread(self.experiment_thread)
 
+        timing = self.dashboard.get_temp_sweep().get_timing_settings()
+
         self.experiment_worker.configure(
             lakeshore_ctrl=self.lakeshore_worker._controller,
             laser_ctrl=self.laser_worker._laser,
@@ -565,6 +573,8 @@ class MainWindow(QMainWindow):
             vna_power_list=vna_settings.get("power_dbm", [-45]),
             output_dir=output_dir,
             vna_settings=vna_settings,
+            pre_measurement_wait_s=timing["pre_measurement_wait_min"] * 60,
+            max_wait_s=timing["max_wait_min"] * 60,
         )
 
         w = self.experiment_worker
@@ -584,6 +594,24 @@ class MainWindow(QMainWindow):
         w.experiment_finished.connect(self._on_experiment_finished)
         w.experiment_error.connect(self._on_experiment_error)
         w.experiment_aborted.connect(self._on_experiment_aborted)
+        w.memory_critical.connect(lambda msg: QMessageBox.warning(
+            self, "⚠ Memory Critical", msg))
+
+        # ---- 断点续传信号 ----
+        w.experiment_resume_prompt.connect(
+            self._on_experiment_resume_prompt,
+            Qt.BlockingQueuedConnection)
+        w.experiment_recovering.connect(
+            lambda msg: self.dashboard.log(
+                f"[{time.strftime('%H:%M:%S')}] 🔴 VISA 连接丢失: {msg}"))
+        w.experiment_recovered.connect(
+            lambda: self.dashboard.log(
+                f"[{time.strftime('%H:%M:%S')}] 🟢 所有设备重连成功，实验恢复"))
+        w.experiment_recovery_timeout.connect(
+            lambda: QMessageBox.warning(
+                self, "重连超时",
+                "设备重连已超时。\n\n"
+                "检查点文件已保存，您可稍后手动恢复实验。"))
 
         self.experiment_thread.started.connect(w.run)
         self.experiment_thread.start()
@@ -613,7 +641,59 @@ class MainWindow(QMainWindow):
         self._cleanup_experiment()
         self.dashboard.log(_ts() + "Experiment aborted by user")
 
+    def _on_experiment_resume_prompt(self, experiment_id: str,
+                                      completed_count: int):
+        """检测到未完成实验的检查点，询问用户是否恢复。
+
+        通过 BlockingQueuedConnection 从实验线程同步调用。
+        """
+        msg = QMessageBox(self)
+        msg.setWindowTitle("恢复实验")
+        msg.setIcon(QMessageBox.Question)
+        msg.setText(
+            f"检测到未完成的实验\n\n"
+            f"实验 ID: {experiment_id}\n"
+            f"已完成: {completed_count} 个测量点\n\n"
+            f"是否恢复？")
+        msg.setStandardButtons(
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+        msg.button(QMessageBox.Yes).setText("恢复 (Resume)")
+        msg.button(QMessageBox.No).setText("重新开始 (Restart)")
+        msg.button(QMessageBox.Cancel).setText("取消 (Cancel)")
+        msg.setDefaultButton(QMessageBox.Yes)
+
+        result = msg.exec_()
+
+        if result == QMessageBox.Yes:
+            self.dashboard.log(
+                _ts() + f"从检查点恢复实验 {experiment_id}")
+            self.experiment_worker._resume_action = "resume"
+        elif result == QMessageBox.No:
+            self.dashboard.log(
+                _ts() + f"放弃检查点，重新开始实验")
+            self.experiment_worker._resume_action = "restart"
+        else:  # Cancel
+            self.dashboard.log(
+                _ts() + f"用户取消恢复，实验不启动")
+            self.experiment_worker._resume_action = "cancel"
+
     def _cleanup_experiment(self):
+        # ---- 断开所有信号连接，打破循环引用，防止僵尸 worker 累积 ----
+        if self.experiment_worker:
+            w = self.experiment_worker
+            for sig_name in (
+                "progress", "temperature_stabilizing", "temperature_stable",
+                "measurement_started", "measurement_complete",
+                "experiment_finished", "experiment_error", "experiment_aborted",
+                "experiment_started", "memory_critical",
+            ):
+                sig = getattr(w, sig_name, None)
+                if sig is not None:
+                    try:
+                        sig.disconnect()
+                    except TypeError:
+                        pass  # 已断开或无连接
+
         if self.experiment_thread:
             self.experiment_thread.quit()
             self.experiment_thread.wait(5000)
@@ -623,9 +703,55 @@ class MainWindow(QMainWindow):
         # 实验结束后恢复 LakeShore 轮询
         if self._connected.get("lakeshore", False):
             self._poll_timer.start()
-        # 实验结束后恢复 LakeShore 轮询
-        if self._connected.get("lakeshore", False):
-            self._poll_timer.start()
+
+    # ==================================================================
+    # --resume 自动恢复
+    # ==================================================================
+
+    def _auto_resume_experiment(self):
+        """--resume 模式下自动加载 checkpoint 并配置 dashboard。"""
+        if not self._resume_path:
+            return
+
+        checkpoint_path = os.path.join(self._resume_path, "checkpoint.json")
+        if not os.path.exists(checkpoint_path):
+            self.dashboard.log("⚠ --resume 模式但 checkpoint.json 不存在，无法自动恢复")
+            return
+
+        # 加载 checkpoint
+        try:
+            with open(checkpoint_path, "r", encoding="utf-8") as f:
+                ckpt = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            self.dashboard.log("⚠ checkpoint.json 损坏，无法自动恢复")
+            return
+
+        state = ckpt.get("state", {})
+        original_temps = ckpt.get("original_temp_list",
+                                  state.get("original_temp_list", []))
+        original_vna = ckpt.get("original_vna_power_list",
+                                state.get("original_vna_power_list", []))
+        original_powers = ckpt.get("original_power_list",
+                                   state.get("original_power_list", []))
+        temp_idx = state.get("temp_idx", 0)
+
+        if temp_idx >= len(original_temps):
+            self.dashboard.log("✓ 实验已完成，无需恢复")
+            return
+
+        self.dashboard.log(f"=== 从 {self._resume_path} 恢复实验 ===")
+        self.dashboard.log(f"  跳过 {temp_idx}/{len(original_temps)} 个温度点")
+        self.dashboard.log(f"  从 {original_temps[temp_idx]:.1f}K 开始")
+
+        # 将 resume 信息传递给 Dashboard
+        if hasattr(self.dashboard, "set_resume_config"):
+            self.dashboard.set_resume_config(
+                resume_path=self._resume_path,
+                temp_list=original_temps,
+                vna_power_list=original_vna,
+                power_list=original_powers,
+                start_temp_idx=temp_idx,
+            )
 
     # ==================================================================
     # cleanup

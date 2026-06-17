@@ -11,6 +11,8 @@ Pattern based on DeviceWorker in Lakeshore335_output.py.
 
 from dataclasses import dataclass
 from typing import Optional
+import json
+import os
 
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 
@@ -811,6 +813,9 @@ class ExperimentWorker(QObject):
         self._vna_power_list = []
         self._output_dir = ""
         self._vna_settings = {}
+        # Claude 主动监控
+        self._status_writer = None
+        self._meltdown_threshold_k = 0.25  # 默认值，configure 中覆盖
 
     def configure(
         self,
@@ -839,6 +844,8 @@ class ExperimentWorker(QObject):
         self._laser_was_off = True   # Fix 3: 初始状态激光关闭
         import config
         self._max_wait_s = max_wait_s if max_wait_s is not None else config.max_wait_seconds
+        self._meltdown_threshold_k = getattr(
+            config, "inter_measurement_max_delta_k", 0.25)
 
     @pyqtSlot()
     def abort(self):
@@ -992,6 +999,114 @@ class ExperimentWorker(QObject):
         return (True, "")
 
     # ------------------------------------------------------------------
+    # 断点续传: 恢复检查点
+    # ------------------------------------------------------------------
+
+    def _resume_from_checkpoint(self, ckpt_state: dict,
+                                 ckpt_completed: list) -> tuple:
+        """从检查点恢复运行状态。
+
+        Returns:
+            (temp_idx, vna_idx, power_idx) — 恢复起点索引
+        """
+        # 恢复回退状态机变量
+        self._checkpoint_consecutive = ckpt_state.get(
+            "rollback_consecutive_issues", 0)
+        self._checkpoint_first_issue_idx = ckpt_state.get(
+            "rollback_first_issue_index", None)
+        self._checkpoint_rollback_count = ckpt_state.get(
+            "rollback_count", 0)
+        self._checkpoint_overshoot = ckpt_state.get(
+            "overshoot_learning", {})
+
+        # 恢复扩展时间参数
+        self._checkpoint_max_wait = ckpt_state.get(
+            "extended_max_wait_s", self._max_wait_s)
+        self._checkpoint_pre_wait = ckpt_state.get(
+            "extended_pre_wait_s", self._pre_measurement_wait_s)
+
+        # 恢复已完成测量点
+        self._checkpoint_completed_points = list(ckpt_completed)
+        self._checkpoint_total_count = ckpt_state.get("total_count", 0)
+
+        # 确定恢复起点
+        resume = CheckpointManager.resume_from(
+            ckpt_completed,
+            self._temp_list,
+            self._vna_power_list,
+            self._power_list,
+        )
+        if resume is None:
+            # 全部完成 → 从最后一个温度点之后开始（正常结束）
+            return (len(self._temp_list), 0, 0)
+
+        temp_idx, vna_idx, power_idx = resume
+        self._checkpoint_temp_idx = temp_idx
+        self._checkpoint_vna_idx = vna_idx
+        self._checkpoint_power_idx = power_idx
+
+        self.progress.emit(
+            f"  从检查点恢复: 温度 #{temp_idx + 1}/{len(self._temp_list)} "
+            f"({self._temp_list[temp_idx]:.1f}K), "
+            f"已完成 {len(ckpt_completed)} 个测量点")
+
+        return resume
+
+    # ------------------------------------------------------------------
+    # 断点续传: 旧 attempt 清理
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cleanup_old_attempts(output_dir: str):
+        """实验正常结束时，每个测量点仅保留最新的 attempt。
+
+        扫描所有 S2P 文件，按 (temp, vna_dbm, power_mw) 分组，
+        每组中按 attempt 降序保留最新文件，删除带旧 attempt 的文件。
+        """
+        import os as _os
+        import glob as _glob
+        import re as _re
+        import config
+
+        if not getattr(config, "checkpoint_keep_latest_attempt_only", True):
+            return
+
+        pattern = _os.path.join(output_dir, "**", "*.s2p")
+        s2p_files = _glob.glob(pattern, recursive=True)
+
+        # 按 (temp, vna_dbm, power_mw) 分组
+        groups = {}
+        for fpath in s2p_files:
+            fname = _os.path.basename(fpath)
+            match = _re.match(
+                r"YBCO_([+-]\d+)dBm_(\d+)mW_target_(\d+)K"
+                r"(?:_attempt(\d+))?_actual_([\d.]+)K\.s2p", fname)
+            if not match:
+                continue
+
+            vna_dbm = int(match.group(1))
+            power_mw = int(match.group(2))
+            temp_k = int(match.group(3))
+            attempt = int(match.group(4)) if match.group(4) else 0
+            actual_k = float(match.group(5))
+
+            key = (temp_k, vna_dbm, power_mw)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append((attempt, actual_k, fpath))
+
+        # 每组仅保留最新的（按 attempt 降序，最高 attempt = 最新）
+        for key, files in groups.items():
+            if len(files) <= 1:
+                continue
+            files.sort(key=lambda x: x[0], reverse=True)
+            for attempt, actual_k, fpath in files[1:]:
+                try:
+                    _os.remove(fpath)
+                except OSError:
+                    pass
+
+    # ------------------------------------------------------------------
     # 断点续传: 保存检查点
     # ------------------------------------------------------------------
 
@@ -1108,11 +1223,359 @@ class ExperimentWorker(QObject):
         self.experiment_recovery_timeout.emit()
 
     # ------------------------------------------------------------------
+    # 断点续传: 检查点辅助
+    # ------------------------------------------------------------------
+
+    def _update_checkpoint_state(self, temp_idx: int, vna_idx: int,
+                                  power_idx: int, current_temp: float,
+                                  total_count: int,
+                                  extended_max_wait_s: float,
+                                  extended_pre_wait_s: float):
+        """更新运行中的检查点追踪变量（不写入磁盘）。"""
+        self._checkpoint_temp_idx = temp_idx
+        self._checkpoint_vna_idx = vna_idx
+        self._checkpoint_power_idx = power_idx
+        self._checkpoint_current_temp = current_temp
+        self._checkpoint_total_count = total_count
+        self._checkpoint_max_wait = extended_max_wait_s
+        self._checkpoint_pre_wait = extended_pre_wait_s
+
+    def _record_measurement_point(self, temp_k: float, vna_dbm: int,
+                                   power_mw: int, actual_k: float):
+        """记录一个已完成测量点到 completed_points。
+
+        每 N 个点增量保存到磁盘（由 checkpoint_save_interval_points 控制）。
+        """
+        if not hasattr(self, "_checkpoint_completed_points"):
+            self._checkpoint_completed_points = []
+        self._checkpoint_completed_points.append({
+            "temp_k": temp_k,
+            "vna_dbm": vna_dbm,
+            "power_mw": power_mw,
+            "actual_k": actual_k,
+        })
+
+        # 每 N 个点增量保存
+        import config
+        interval = getattr(config, "checkpoint_save_interval_points", 5)
+        if len(self._checkpoint_completed_points) % interval == 0:
+            self._save_checkpoint()
+
+    # ------------------------------------------------------------------
+    # Claude 主动监控: status.json + commands.json
+    # ------------------------------------------------------------------
+
+    def _write_status(self, phase: str = None, target_k: float = None,
+                      actual_k: float = None, vna_dbm: float = None,
+                      laser_mw: float = None):
+        """将当前状态写入 status.json（供 Claude Code 监控）。
+
+        写入失败时静默降级（不抛异常），不影响实验运行。
+        """
+        if not self._output_dir:
+            return
+        try:
+            if self._status_writer is None:
+                from experiment_status import ExperimentStatusWriter
+                self._status_writer = ExperimentStatusWriter(self._output_dir)
+                # 首次写入：初始化完整状态
+                import config
+                self._status_writer.write_initial(
+                    experiment_id=os.path.basename(self._output_dir),
+                    temperature_plan=self._temp_list,
+                    vna_power_plan=self._vna_power_list,
+                    laser_power_plan=self._power_list,
+                    runtime_params={
+                        "max_wait_seconds": self._max_wait_s,
+                        "meltdown_threshold_k": self._meltdown_threshold_k,
+                        "max_meltdown_restarts": getattr(
+                            config, "max_meltdown_restarts", 3),
+                        "current_overshoot_k": getattr(
+                            self, "_current_overshoot", 0),
+                    },
+                )
+
+            self._status_writer.update_current(
+                target_k=target_k, actual_k=actual_k,
+                vna_dbm=vna_dbm, laser_mw=laser_mw, phase=phase,
+            )
+        except Exception:
+            pass  # 状态写入失败不影响实验
+
+    def _poll_commands(self):
+        """读取 commands.json，应用 Claude Code 发出的干预命令。
+
+        在温度点切换、熔断触发前等决策点调用。
+        """
+        if not self._output_dir:
+            return
+        cmd_path = os.path.join(self._output_dir, "commands.json")
+        if not os.path.exists(cmd_path):
+            return
+        import json
+        try:
+            with open(cmd_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        modified = False
+        for cmd in data.get("commands", []):
+            if cmd.get("status") != "pending":
+                continue
+
+            action = cmd.get("action", "")
+            params = cmd.get("params", {})
+
+            if action == "extend_max_wait":
+                add_min = int(params.get("add_minutes", 30))
+                self._max_wait_s += add_min * 60
+                self.progress.emit(
+                    f"  [Claude] max_wait +{add_min}min → "
+                    f"{self._max_wait_s // 60}min: {cmd.get('reason', '')}")
+                cmd["status"] = "applied"
+                modified = True
+
+            elif action == "relax_meltdown":
+                new_threshold = float(params.get("new_threshold_k", 0.35))
+                self._meltdown_threshold_k = new_threshold
+                self.progress.emit(
+                    f"  [Claude] 熔断阈值放宽至 {new_threshold}K: "
+                    f"{cmd.get('reason', '')}")
+                cmd["status"] = "applied"
+                modified = True
+
+            elif action == "skip_temperature":
+                self.progress.emit(
+                    f"  [Claude] 建议跳过当前温度点: "
+                    f"{cmd.get('reason', '')}")
+                cmd["status"] = "applied"
+                modified = True
+
+        if modified:
+            try:
+                with open(cmd_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # 补测模式 (fill mode)
+    # ------------------------------------------------------------------
+
+    def _run_fill(self, experiment_dir: str):
+        """执行补测：冷却 → 升温稳定 → 测量缺失点 → 写入完成报告。
+
+        Args:
+            experiment_dir: 实验输出目录（含 fill_plan.json）
+        """
+        import json
+        import config
+        import time as _time
+
+        fill_plan_path = os.path.join(experiment_dir, "fill_plan.json")
+        if not os.path.exists(fill_plan_path):
+            self.progress.emit(f"  [错误] 未找到 fill_plan.json: {fill_plan_path}")
+            return
+
+        with open(fill_plan_path, "r", encoding="utf-8") as f:
+            fill_plan = json.load(f)
+
+        temp_plan = fill_plan.get("temperature_plan", [])
+        measurements = fill_plan.get("measurements", [])
+        cooldown_offset = fill_plan.get(
+            "cooldown_offset_k", config.fill_cooldown_offset_k)
+        total_expected = sum(len(m.get("laser_powers_mw", []))
+                             for m in measurements)
+        total_measured = 0
+
+        self._output_dir = experiment_dir
+        self.progress.emit(f"补测开始 — {len(temp_plan)} 个温度点, "
+                           f"{total_expected} 个测量点")
+
+        for target_k in temp_plan:
+            if self._abort_flag:
+                break
+
+            # 阶段 1: 冷却 (setpoint = target - offset)
+            cool_setpoint = target_k - cooldown_offset
+            cool_setpoint = max(cool_setpoint, config.fill_min_safe_temp_k)
+            self.progress.emit(
+                f"  → 冷却至 {cool_setpoint:.1f}K (target={target_k}K - "
+                f"{cooldown_offset}K)")
+
+            if self._lakeshore_ctrl:
+                self._lakeshore_ctrl.set_temperature(cool_setpoint, loop=1)
+
+            # 等待实际温度低于目标
+            cool_start = _time.monotonic()
+            cool_max_s = config.fill_cooldown_max_wait_minutes * 60
+            cool_poll = config.fill_cooldown_poll_seconds
+            cool_iter = 0
+            cool_max_iter = int(cool_max_s / cool_poll) + 10  # 安全上限
+
+            while not self._abort_flag and cool_iter < cool_max_iter:
+                _time.sleep(cool_poll)
+                cool_iter += 1
+                actual = self._lakeshore_ctrl.get_temperature() if self._lakeshore_ctrl else target_k - 1
+                if actual < target_k:
+                    self.progress.emit(f"  冷却完成: {actual:.3f}K < {target_k}K")
+                    break
+                if _time.monotonic() - cool_start > cool_max_s:
+                    self.progress.emit(
+                        f"  ⚠ 冷却超时 ({cool_max_s // 60}min)，继续执行")
+                    break
+
+            if self._abort_flag:
+                break
+
+            # 阶段 2: 升温稳定 (setpoint = target + overshoot)
+            self.progress.emit(f"  → 升温至 {target_k:.1f}K 并稳定")
+            # 使用现有稳定逻辑：调用 set_temperature(target_k)
+            if self._lakeshore_ctrl:
+                self._lakeshore_ctrl.set_temperature(target_k, loop=1)
+
+            # 简化稳定等待（补测模式用 basic wait）
+            _time.sleep(10)  # 升温阶段等待
+            # 简单轮询等待进入 target_k ± 1K
+            stable_ok = False
+            stable_max_iter = 120  # 最多 120 次迭代
+            for stable_iter in range(stable_max_iter):
+                if self._abort_flag:
+                    break
+                _time.sleep(10)
+                actual = self._lakeshore_ctrl.get_temperature() if self._lakeshore_ctrl else target_k
+                if abs(actual - target_k) < 1.0:
+                    stable_ok = True
+                    break
+                self.progress.emit(
+                    f"  等待稳定: {actual:.3f}K (target={target_k}K)")
+
+            if not stable_ok or self._abort_flag:
+                continue
+
+            # 阶段 3: 补测扫描
+            for m in measurements:
+                if m["target_k"] != target_k:
+                    continue
+
+                vna_dbm = m["vna_dbm"]
+                for power_mw in m.get("laser_powers_mw", []):
+                    if self._abort_flag:
+                        break
+
+                    # 检查是否已有 .s2p 文件（去重）
+                    from fill_planner import scan_s2p_files
+                    existing = scan_s2p_files(experiment_dir)
+                    existing_set = {(e["target_k"], e["vna_dbm"], e["power_mw"])
+                                    for e in existing}
+                    if (target_k, vna_dbm, power_mw) in existing_set:
+                        self.progress.emit(
+                            f"  跳过已存在: {target_k}K {vna_dbm:+d}dBm "
+                            f"{power_mw}mW")
+                        total_measured += 1
+                        continue
+
+                    # 设置 VNA 功率
+                    if self._vna:
+                        try:
+                            self._vna.write(f":SOURce:POWer {vna_dbm}")
+                        except Exception:
+                            pass
+
+                    # 设置激光功率
+                    if self._laser_ctrl and power_mw > 0:
+                        self._laser_ctrl.set_power(power_mw)
+                        self._laser_ctrl.output_on()
+                    elif self._laser_ctrl:
+                        self._laser_ctrl.output_off()
+
+                    _time.sleep(5)  # 简短沉降
+
+                    actual_k = (self._lakeshore_ctrl.get_temperature()
+                                if self._lakeshore_ctrl else target_k)
+
+                    self.progress.emit(
+                        f"  Measuring {vna_dbm:+d} dBm / {power_mw} mW "
+                        f"@ {actual_k:.3f} K")
+
+                    # 构建输出路径
+                    temp_str = f"{target_k:.0f}K"
+                    vna_str = f"{vna_dbm:+d}dBm"
+                    pw_str = f"{power_mw:02d}mW"
+                    folder = os.path.join(experiment_dir, temp_str, vna_str, pw_str)
+                    os.makedirs(folder, exist_ok=True)
+                    filename = (
+                        f"YBCO_{vna_dbm:+d}dBm_{power_mw:02d}mW_"
+                        f"target_{target_k:.0f}K_actual_{actual_k:.3f}K.s2p"
+                    )
+                    filepath = os.path.join(folder, filename)
+
+                    # VNA S2P 保存
+                    if self._vna:
+                        try:
+                            self._vna.write(":INITiate:CONTinuous OFF")
+                            self._vna.write(":INITiate:IMMediate")
+                            _time.sleep(2)
+                            self._vna.write(f':MMEMory:STORe "{filepath}"')
+                        except Exception as e:
+                            self.progress.emit(f"  VNA 保存失败: {e}")
+
+                    total_measured += 1
+
+            # 温度点完成后关激光
+            if self._laser_ctrl:
+                self._laser_ctrl.output_off()
+
+        # 阶段 4: 完成
+        self._write_fill_complete(experiment_dir, total_measured, total_expected)
+        self.progress.emit(
+            f"补测完成 — {total_measured}/{total_expected} 个测量点")
+        self.experiment_finished.emit(total_measured)
+
+    def _write_fill_complete(self, output_dir: str,
+                             total_measured: int, total_expected: int):
+        """写入 fill_complete.json。"""
+        import json
+        from datetime import datetime, timezone
+
+        completeness = (total_measured / total_expected
+                        if total_expected > 0 else 1.0)
+        report = {
+            "completed_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S"),
+            "total_measured": total_measured,
+            "total_expected": total_expected,
+            "completeness": completeness,
+        }
+        path = os.path.join(output_dir, "fill_complete.json")
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # 实验主循环
     # ------------------------------------------------------------------
 
     @pyqtSlot()
     def run(self):
+        """Public entry point — wraps _run_impl with recovery on connection loss."""
+        try:
+            self._run_impl()
+        except Exception as e:
+            if self._is_recoverable_error(e):
+                self._enter_recovery(e)
+            else:
+                self.experiment_error.emit(f"Experiment failed: {e}")
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+
+    def _run_impl(self):
         try:
             from datetime import datetime
             import time as _time
@@ -1191,6 +1654,20 @@ class ExperimentWorker(QObject):
             _extended_max_wait_s = self._max_wait_s
             _extended_pre_wait_s = self._pre_measurement_wait_s
 
+            # ---- 初始化 checkpoint 追踪变量 ----
+            self._checkpoint_completed_points = []
+            self._checkpoint_temp_idx = 0
+            self._checkpoint_vna_idx = 0
+            self._checkpoint_power_idx = 0
+            self._checkpoint_current_temp = self._temp_list[0] if self._temp_list else 0
+            self._checkpoint_total_count = 0
+            self._checkpoint_max_wait = _extended_max_wait_s
+            self._checkpoint_pre_wait = _extended_pre_wait_s
+            self._checkpoint_consecutive = 0
+            self._checkpoint_first_issue_idx = None
+            self._checkpoint_rollback_count = 0
+            self._checkpoint_overshoot = {}
+
             # ---- 加载 overshoot 学习历史（跨实验持久化） ----
             _overshoot_learning = {}
             try:
@@ -1211,6 +1688,38 @@ class ExperimentWorker(QObject):
                 pass  # 首次运行或无学习数据，使用默认值
 
             temp_idx = 0
+
+            # ---- 检查点恢复询问 ----
+            checkpoint = CheckpointManager.load(self._output_dir)
+            if checkpoint is not None:
+                ckpt_state, ckpt_completed = checkpoint
+                import os as _os2
+                exp_id = _os2.path.basename(self._output_dir)
+                self.experiment_resume_prompt.emit(exp_id, len(ckpt_completed))
+                # 等待 GUI 回调（QMessageBox 模态 → BlockingQueuedConnection 同步返回）
+                resume_action = getattr(self, "_resume_action", "cancel")
+                if resume_action == "resume":
+                    resume_idx = self._resume_from_checkpoint(ckpt_state, ckpt_completed)
+                    if resume_idx is not None:
+                        temp_idx, _vi, _pi = resume_idx
+                        # 同步扩展时间参数
+                        if hasattr(self, "_checkpoint_max_wait"):
+                            _extended_max_wait_s = self._checkpoint_max_wait
+                        if hasattr(self, "_checkpoint_pre_wait"):
+                            _extended_pre_wait_s = self._checkpoint_pre_wait
+                        # 同步回退状态机
+                        _rollback_state.consecutive_issues = (
+                            self._checkpoint_consecutive)
+                        _rollback_state.first_issue_index = (
+                            self._checkpoint_first_issue_idx)
+                        _rollback_state.rollback_count = (
+                            self._checkpoint_rollback_count)
+                elif resume_action == "restart":
+                    CheckpointManager.delete(self._output_dir)
+                elif resume_action == "cancel":
+                    self.progress.emit("用户取消恢复，实验不启动")
+                    temp_idx = len(self._temp_list)  # 跳过所有温度点
+
             while temp_idx < len(self._temp_list):
                 target_k = self._temp_list[temp_idx]
 
@@ -1532,7 +2041,7 @@ class ExperimentWorker(QObject):
                             self._vna.write(
                                 f':DISPlay:WINDow1:TRACe1:FEED "{sp}"')
 
-                    for vna_dbm in vna_powers:
+                    for vi, vna_dbm in enumerate(vna_powers):
                         if self._abort_flag or not measurement_ok:
                             break
 
@@ -1540,7 +2049,7 @@ class ExperimentWorker(QObject):
                         if self._vna:
                             self._vna.write(f":SOURce:POWer {vna_dbm}")
 
-                        for power_mw in self._power_list:
+                        for pi, power_mw in enumerate(self._power_list):
                             if self._abort_flag:
                                 self.experiment_aborted.emit()
                                 log_file.close()
@@ -1620,10 +2129,8 @@ class ExperimentWorker(QObject):
                                 f"{vna_dbm:+d}dBm",
                                 f"{power_mw:02d}mW")
                             os.makedirs(folder, exist_ok=True)
-                            filename = (
-                                f"YBCO_{vna_dbm:+d}dBm_"
-                                f"{power_mw:02d}mW_target_{temp_str}"
-                                f"_actual_{pre_temp:.3f}K.s2p")
+                            filename = self._find_next_filename(
+                                folder, target_k, vna_dbm, power_mw, pre_temp)
                             filepath = os.path.join(folder, filename)
 
                             # sweep + save S2P
@@ -1673,6 +2180,13 @@ class ExperimentWorker(QObject):
                                 post_temp, power_mw, filepath)
                             # 更新 actual_k 为最新温度
                             actual_k = post_temp
+
+                            # ---- checkpoint: 记录已完成测量点 ----
+                            self._record_measurement_point(
+                                target_k, vna_dbm, power_mw, post_temp)
+                            self._update_checkpoint_state(
+                                temp_idx, vi, pi, post_temp, count,
+                                _extended_max_wait_s, _extended_pre_wait_s)
 
                         if not measurement_ok:
                             break  # 跳出 VNA 功率循环
@@ -1892,10 +2406,23 @@ class ExperimentWorker(QObject):
                 _log(f"⚠ readme.txt 生成失败: {e}")
 
             _log(f"日志文件: {log_path}")
+
+            # ---- 实验正常完成: 删除检查点 + 清理旧 attempt 文件 ----
+            CheckpointManager.delete(self._output_dir)
+            self._cleanup_old_attempts(self._output_dir)
+
             log_file.close()
             self.experiment_finished.emit(count)
 
         except Exception as e:
+            # 可恢复的连接错误 → 传播到外层 run() 触发断点续传
+            if self._is_recoverable_error(e):
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+                raise
+            # 不可恢复的错误 → 终止实验
             self.experiment_error.emit(f"Experiment failed: {e}")
             try:
                 log_file.close()

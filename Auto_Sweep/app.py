@@ -13,6 +13,7 @@ Requirements:
 """
 
 import argparse
+import os
 import sys
 from PyQt5.QtWidgets import QApplication
 from ui.main_window import MainWindow
@@ -39,6 +40,14 @@ def parse_args():
         "--resume-path", type=str, default=None, metavar="DIR",
         help="实验输出目录（仅 --watchdog）",
     )
+    parser.add_argument(
+        "--fill", type=str, default=None, metavar="DIR",
+        help="补测模式：指定实验输出目录，读取 fill_plan.json 执行补测",
+    )
+    parser.add_argument(
+        "--no-gui", action="store_true",
+        help="无 GUI 模式（配合 --fill 使用，后台执行补测）",
+    )
     return parser.parse_args()
 
 
@@ -56,7 +65,40 @@ def main() -> int:
         watchdog_run(args.child_pid, args.resume_path, timeout)
         return 0
 
-    # ---- 模式 2 & 3: GUI (normal + resume) ----
+    # ---- 模式 4: 补测 fill mode (headless) ----
+    if args.fill and args.no_gui:
+        fill_dir = os.path.abspath(args.fill)
+        if not os.path.isdir(fill_dir):
+            print(f"Error: fill directory not found: {fill_dir}")
+            return 1
+        fill_plan_path = os.path.join(fill_dir, "fill_plan.json")
+        if not os.path.exists(fill_plan_path):
+            print(f"Error: fill_plan.json not found in {fill_dir}")
+            return 1
+
+        import json
+        print(f"补测模式: {fill_dir}")
+        with open(fill_plan_path, "r", encoding="utf-8") as f:
+            plan = json.load(f)
+        print(f"  温度点: {plan.get('temperature_plan', [])}")
+        print(f"  测量点: {sum(len(m.get('laser_powers_mw', []))
+                          for m in plan.get('measurements', []))}")
+
+        from PyQt5.QtCore import QCoreApplication
+        _ = QCoreApplication(sys.argv)
+        from ui.workers import ExperimentWorker
+        worker = ExperimentWorker()
+        worker.configure(
+            temp_list=plan.get("temperature_plan", []),
+            power_list=[],
+            vna_power_list=[],
+            output_dir=fill_dir,
+        )
+        worker._run_fill(fill_dir)
+        return 0
+
+    # ---- 模式 2 & 3 & 4: GUI (normal + resume + fill GUI) ----
+    fill_path = os.path.abspath(args.fill) if args.fill and not args.no_gui else None
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
@@ -212,7 +254,7 @@ def main() -> int:
     # resume_path 传递给 MainWindow
     resume_path = args.resume
 
-    win = MainWindow(resume_path=resume_path)
+    win = MainWindow(resume_path=resume_path, fill_path=fill_path)
     win.show()
     return app.exec_()
 
