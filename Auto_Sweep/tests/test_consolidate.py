@@ -359,3 +359,129 @@ class TestIsAlreadyConsolidated:
 
         with tempfile.TemporaryDirectory() as tmp:
             assert _is_already_consolidated(tmp) is False
+
+
+class TestEndToEnd:
+    """完整流程: 扫描 → 分组 → 去重 → 清理 → 合并。"""
+
+    def test_given_fragmented_runs_when_full_pipeline_then_merged(self):
+        """模拟 accomplish/ 场景: 多个碎片, 温度互补, 有重叠。"""
+        from consolidate import (
+            scan_run, is_junk, group_runs,
+            resolve_conflicts, clean_far_target,
+            build_consolidated_name, _merge_group,
+        )
+        import tempfile, shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "experiment_data")
+            os.makedirs(base)
+
+            # Fragment 1: T=10-18K (5 temps, 3 Pv x 2 Pl = 30 files)
+            run1 = os.path.join(base, "20260611_115038")
+            os.makedirs(run1)
+            os.makedirs(os.path.join(run1, "logs"))
+            with open(os.path.join(run1, "logs", "log1.txt"), "w") as f:
+                f.write("exp start")
+            m = {
+                "experiment_id": "20260611_115038",
+                "start_time": "2026-06-11T11:50:38",
+                "temperature_plan": [10.0, 12.0, 14.0, 16.0, 18.0, 20.0],
+                "vna_power_plan": [-55, -45, -35],
+                "laser_power_plan": [0, 5, 9],
+            }
+            with open(os.path.join(run1, "manifest.json"), "w") as f:
+                json.dump(m, f)
+            for t in [10.0, 12.0, 14.0, 16.0, 18.0]:
+                for pv in [-55, -45, -35]:
+                    for pl in [0, 5]:
+                        d = os.path.join(run1, f"{t:g}K", f"{pv:g}dBm", f"{pl:02.0f}mW")
+                        os.makedirs(d)
+                        fname = (
+                            f"YBCO_{pv:g}dBm_{pl:02.0f}mW"
+                            f"_target_{t:g}K_actual_{t-0.01:.3f}K.s2p"
+                        )
+                        with open(os.path.join(d, fname), "w") as f:
+                            f.write("! s2p data")
+
+            # Fragment 2: T=18-22K (3 temps, 3 Pv x 2 Pl = 18 files)
+            # Overlap at T=18K (also in run1) for dedup verification
+            run2 = os.path.join(base, "20260612_014432")
+            os.makedirs(run2)
+            os.makedirs(os.path.join(run2, "logs"))
+            m2 = {
+                "experiment_id": "20260612_014432",
+                "start_time": "2026-06-12T01:44:32",
+                "temperature_plan": [18.0, 20.0, 22.0, 24.0, 26.0, 28.0],
+                "vna_power_plan": [-55, -45, -35],
+                "laser_power_plan": [0, 5, 9],
+            }
+            with open(os.path.join(run2, "manifest.json"), "w") as f:
+                json.dump(m2, f)
+            for t in [18.0, 20.0, 22.0]:
+                for pv in [-55, -45, -35]:
+                    for pl in [0, 5]:
+                        d = os.path.join(run2, f"{t:g}K", f"{pv:g}dBm", f"{pl:02.0f}mW")
+                        os.makedirs(d)
+                        fname = (
+                            f"YBCO_{pv:g}dBm_{pl:02.0f}mW"
+                            f"_target_{t:g}K_actual_{t+0.02:.3f}K.s2p"
+                        )
+                        with open(os.path.join(d, fname), "w") as f:
+                            f.write("! s2p data")
+
+            # --- Run pipeline ---
+            runs = []
+            for entry in os.listdir(base):
+                info = scan_run(os.path.join(base, entry))
+                if info:
+                    runs.append(info)
+
+            assert len(runs) == 2
+
+            # No junk
+            junk = [r for r in runs if is_junk(r)]
+            assert len(junk) == 0
+
+            # One group (temps adjacent: 10-18 and 18-22, gap <= 1 step)
+            groups = group_runs(runs)
+            assert len(groups) == 1
+            assert len(groups[0]) == 2
+
+            # Dedup: 18K appears in both runs → 6 deduped, 42 kept
+            kept, warnings = resolve_conflicts(groups[0])
+            # 5 temps from run1 (10,12,14,16,18) + 2 unique from run2 (20,22) = 7
+            # 7 temps * 3 Pv * 2 Pl = 42
+            assert len(kept) == 42, f"Expected 42, got {len(kept)}"
+
+            # Clean far-target (all stable in this test)
+            kept2, removed = clean_far_target(kept)
+            assert len(removed) == 0
+
+            # Merge
+            name = build_consolidated_name(groups[0], len(kept2))
+            assert "20260611" in name
+            assert "10-22K" in name
+            assert "42pts" in name
+
+            merged = _merge_group(groups[0], kept2, base)
+            assert os.path.isdir(merged)
+
+            # Verify marker txt
+            marker = os.path.join(merged, f"{name}.txt")
+            assert os.path.exists(marker)
+
+            # Verify s2p files in merged (excluding _fragments originals)
+            s2p_count = 0
+            for root, dirs, files in os.walk(merged):
+                # Skip the _fragments sub-tree (contains raw originals)
+                if "_fragments" in root.split(os.sep):
+                    continue
+                s2p_count += sum(1 for f in files if f.endswith(".s2p"))
+            assert s2p_count == 42
+
+            # Verify fragments moved
+            frag_dir = os.path.join(merged, "_fragments")
+            assert os.path.isdir(frag_dir)
+            assert os.path.isdir(os.path.join(frag_dir, "20260611_115038"))
+            assert os.path.isdir(os.path.join(frag_dir, "20260612_014432"))
