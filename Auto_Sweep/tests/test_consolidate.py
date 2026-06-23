@@ -186,3 +186,121 @@ class TestGroupRuns:
 
         groups = group_runs([r1, r2])
         assert len(groups) == 2  # gap too large, separate groups
+
+
+class TestResolveConflicts:
+    """resolve_conflicts 处理同一 T 点多次测量的去重。"""
+
+    def test_given_both_stable_when_resolve_then_keep_later(self):
+        """两份都稳定 → 取时间戳晚的。"""
+        from consolidate import resolve_conflicts, S2PFile, RunInfo
+
+        r1 = RunInfo(id="run1", path="/tmp/run1")
+        r1.s2p_files = [
+            S2PFile(path="a.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=49.9, mtime=100.0),
+        ]
+        r2 = RunInfo(id="run2", path="/tmp/run2")
+        r2.s2p_files = [
+            S2PFile(path="b.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=50.1, mtime=200.0),
+        ]
+
+        kept, _ = resolve_conflicts([r1, r2])
+        assert len(kept) == 1
+        assert kept[0].path == "b.s2p"  # later, both stable
+
+    def test_given_one_stable_one_unstable_when_resolve_then_keep_stable(self):
+        """一稳一不稳 → 取稳的。"""
+        from consolidate import resolve_conflicts, S2PFile, RunInfo
+
+        r1 = RunInfo(id="run1", path="/tmp/run1")
+        r1.s2p_files = [
+            S2PFile(path="stable.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=50.2, mtime=100.0),
+        ]
+        r2 = RunInfo(id="run2", path="/tmp/run2")
+        r2.s2p_files = [
+            S2PFile(path="unstable.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=53.0, mtime=200.0),
+        ]
+
+        kept, warnings = resolve_conflicts([r1, r2])
+        assert len(kept) == 1
+        assert kept[0].path == "stable.s2p"
+        assert len(warnings) == 0  # stable pick, no warning needed
+
+    def test_given_both_unstable_when_resolve_then_keep_closer(self):
+        """都不稳 → 取偏差更小的，标记 warning。"""
+        from consolidate import resolve_conflicts, S2PFile, RunInfo
+
+        r1 = RunInfo(id="run1", path="/tmp/run1")
+        r1.s2p_files = [
+            S2PFile(path="far.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=55.0, mtime=100.0),
+        ]
+        r2 = RunInfo(id="run2", path="/tmp/run2")
+        r2.s2p_files = [
+            S2PFile(path="farther.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=60.0, mtime=200.0),
+        ]
+
+        kept, warnings = resolve_conflicts([r1, r2])
+        assert len(kept) == 1
+        assert kept[0].path == "far.s2p"  # 55 vs 60: 55 is closer
+        assert len(warnings) == 1
+        assert "unstable" in warnings[0].lower()
+
+    def test_given_different_temps_when_resolve_then_keep_both(self):
+        """不同 T 点不冲突。"""
+        from consolidate import resolve_conflicts, S2PFile, RunInfo
+
+        r1 = RunInfo(id="run1", path="/tmp/run1")
+        r1.s2p_files = [
+            S2PFile(path="t50.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=49.9, mtime=100.0),
+        ]
+        r2 = RunInfo(id="run2", path="/tmp/run2")
+        r2.s2p_files = [
+            S2PFile(path="t52.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=52.0, actual_k=52.0, mtime=200.0),
+        ]
+
+        kept, warnings = resolve_conflicts([r1, r2])
+        assert len(kept) == 2
+
+
+class TestCleanFarTarget:
+    """clean_far_target 删除远离目标温度的 s2p 文件。"""
+
+    def test_given_far_target_files_when_clean_then_removed(self):
+        from consolidate import clean_far_target, S2PFile
+
+        files = [
+            S2PFile(path="good.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=50.1, mtime=100.0),
+            S2PFile(path="far.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=53.0, mtime=200.0),
+        ]
+
+        kept, removed = clean_far_target(files)
+        assert len(kept) == 1
+        assert kept[0].path == "good.s2p"
+        assert len(removed) == 1
+        assert removed[0].path == "far.s2p"
+
+    def test_given_all_far_when_clean_then_keep_closest(self):
+        """全都远靶 → 保留最近的一个，标记 warning。"""
+        from consolidate import clean_far_target, S2PFile
+
+        files = [
+            S2PFile(path="a.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=55.0, mtime=100.0),
+            S2PFile(path="b.s2p", vna_dbm=-55, laser_mw=0,
+                    target_k=50.0, actual_k=60.0, mtime=200.0),
+        ]
+
+        kept, removed = clean_far_target(files)
+        assert len(kept) == 1
+        assert kept[0].path == "a.s2p"
+        assert len(removed) == 1

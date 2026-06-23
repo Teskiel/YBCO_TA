@@ -324,3 +324,106 @@ def group_runs(runs: list) -> list[list]:
             groups.append([run])
 
     return groups
+
+
+# =========================================================================
+# Dedup: resolve same-(T, Pv, Pl) conflicts across fragments
+# =========================================================================
+
+FAR_TARGET_THRESHOLD_K = 1.0
+
+
+def _deviation(f: S2PFile) -> float:
+    """Absolute deviation from target temperature."""
+    return abs(f.actual_k - f.target_k)
+
+
+def _is_stable(f: S2PFile) -> bool:
+    """A measurement is 'stable' if actual T is within 1 K of target."""
+    return _deviation(f) <= FAR_TARGET_THRESHOLD_K
+
+
+def _key(f: S2PFile) -> tuple:
+    """Composite key for grouping: (target_k, vna_dbm, laser_mw)."""
+    return (f.target_k, f.vna_dbm, f.laser_mw)
+
+
+def resolve_conflicts(group: list) -> tuple:
+    """Resolve conflicts where same (T, Pv, Pl) appears in multiple fragments.
+
+    Args:
+        group: list of RunInfo belonging to the same consolidation group.
+
+    Returns:
+        (kept: list[S2PFile], warnings: list[str])
+    """
+    # Collect all s2p files grouped by (T, Pv, Pl)
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for run in group:
+        for f in run.s2p_files:
+            buckets[_key(f)].append(f)
+
+    kept = []
+    warnings = []
+
+    for k, copies in buckets.items():
+        if len(copies) == 1:
+            kept.append(copies[0])
+            continue
+
+        stable = [c for c in copies if _is_stable(c)]
+        unstable = [c for c in copies if not _is_stable(c)]
+
+        if len(stable) == 1:
+            # Exactly one stable — keep it
+            kept.append(stable[0])
+        elif len(stable) >= 2:
+            # Multiple stable — keep the latest (by mtime)
+            winner = max(stable, key=lambda c: c.mtime)
+            kept.append(winner)
+        else:
+            # All unstable — keep closest, warn
+            winner = min(copies, key=_deviation)
+            kept.append(winner)
+            tgt = k[0]
+            warnings.append(
+                f"⚠ T={tgt}K: all copies unstable "
+                f"(best Δ={_deviation(winner):.2f}K)"
+            )
+
+    return kept, warnings
+
+
+# =========================================================================
+# Far-target cleanup
+# =========================================================================
+
+def clean_far_target(s2p_files: list) -> tuple:
+    """Delete s2p files where |actual - target| > 1 K.
+
+    Within each (T, Pv, Pl) leaf, keep only the closest measurement.
+    If all are far-target, keep the closest and report as warning.
+
+    Args:
+        s2p_files: list of S2PFile in the merged dataset.
+
+    Returns:
+        (kept: list[S2PFile], removed: list[S2PFile])
+    """
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for f in s2p_files:
+        buckets[_key(f)].append(f)
+
+    kept = []
+    removed = []
+
+    for k, copies in buckets.items():
+        closest = min(copies, key=_deviation)
+        kept.append(closest)
+        for c in copies:
+            if c is not closest:
+                removed.append(c)
+
+    return kept, removed
