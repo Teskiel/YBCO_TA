@@ -427,3 +427,316 @@ def clean_far_target(s2p_files: list) -> tuple:
                 removed.append(c)
 
     return kept, removed
+
+
+# =========================================================================
+# Consolidated folder naming
+# =========================================================================
+
+def build_consolidated_name(group: list, total_pts: int) -> str:
+    """Build the consolidated folder name.
+
+    Format: {first_date}-{last_date}__{minT}-{maxT}K__{N}pts
+    """
+    # Find date range
+    timestamps = [r.timestamp for r in group if r.timestamp is not None]
+    if timestamps:
+        # Strip timezone info to avoid comparing naive and aware datetimes
+        first = min(t.replace(tzinfo=None) for t in timestamps)
+        last = max(t.replace(tzinfo=None) for t in timestamps)
+        first_str = first.strftime("%Y%m%d")
+        last_str = last.strftime("%m%d")  # full YYYYMMDD-MMDD
+    else:
+        # Fallback: use directory name prefix
+        ids = sorted([r.id for r in group])
+        first_str = ids[0][:8] if len(ids[0]) >= 8 else ids[0]
+        last_str = ids[-1][4:8] if len(ids[-1]) >= 8 else ids[-1]
+
+    # Temperature range (integer)
+    all_temps = set()
+    for r in group:
+        all_temps.update(r.target_temps)
+    if all_temps:
+        min_t = int(min(all_temps))
+        max_t = int(max(all_temps))
+    else:
+        min_t = max_t = 0
+
+    return f"{first_str}-{last_str}__{min_t}-{max_t}K__{total_pts}pts"
+
+
+def _is_already_consolidated(dir_path: str) -> bool:
+    """Check if a directory looks like it's already consolidated.
+
+    Detected by presence of a marker .txt file with __ pattern in name.
+    """
+    try:
+        for fname in os.listdir(dir_path):
+            if fname.endswith(".txt") and "__" in fname and "pts" in fname:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+# =========================================================================
+# Merge execution
+# =========================================================================
+
+MERGED_DIR_NAME = "~merged"
+FRAGMENTS_DIR_NAME = "_fragments"
+JUNK_DIR_NAME = "_junk"
+
+
+def _merge_group(group: list, kept_files: list,
+                 base_dir: str, dry_run: bool = False) -> str:
+    """Merge a group of fragments into a unified consolidated directory.
+
+    Args:
+        group: list of RunInfo to merge
+        kept_files: deduplicated S2PFile list to include
+        base_dir: experiment_data directory
+        dry_run: if True, only report what would happen
+
+    Returns:
+        Path to the newly created consolidated directory.
+    """
+    import shutil
+
+    name = build_consolidated_name(group, len(kept_files))
+    merged_dir = os.path.join(base_dir, MERGED_DIR_NAME, name)
+
+    if dry_run:
+        return merged_dir
+
+    os.makedirs(merged_dir, exist_ok=True)
+    fragments_dir = os.path.join(merged_dir, FRAGMENTS_DIR_NAME)
+    os.makedirs(fragments_dir, exist_ok=True)
+
+    # Copy s2p files into the merged tree
+    s2p_by_temp = {}
+    for f in kept_files:
+        s2p_by_temp.setdefault(f.target_k, []).append(f)
+
+    for target_k, files in s2p_by_temp.items():
+        temp_dir = os.path.join(merged_dir, f"{target_k:g}K")
+        for f in files:
+            vna_dir = os.path.join(temp_dir, f"{f.vna_dbm:g}dBm")
+            laser_dir = os.path.join(vna_dir, f"{f.laser_mw:02.0f}mW")
+            os.makedirs(laser_dir, exist_ok=True)
+            # f.path is relative to the run root; resolve source
+            src = None
+            for run in group:
+                candidate = os.path.join(run.path, f.path)
+                if os.path.exists(candidate):
+                    src = candidate
+                    break
+            if src is None:
+                continue
+            dst_filename = (
+                f"YBCO_{f.vna_dbm:g}dBm_{f.laser_mw:02.0f}mW"
+                f"_target_{f.target_k:g}K_actual_{f.actual_k:.3f}K.s2p"
+            )
+            dst = os.path.join(laser_dir, dst_filename)
+            shutil.copy2(src, dst)
+
+    # Merge logs
+    logs_merged = os.path.join(merged_dir, "logs")
+    os.makedirs(logs_merged, exist_ok=True)
+    for run in group:
+        run_logs = os.path.join(run.path, "logs")
+        if os.path.isdir(run_logs):
+            for fname in os.listdir(run_logs):
+                src = os.path.join(run_logs, fname)
+                dst = os.path.join(logs_merged, fname)
+                if os.path.exists(dst):
+                    # Append run id to avoid collision
+                    base, ext = os.path.splitext(fname)
+                    dst = os.path.join(logs_merged, f"{base}_{run.id}{ext}")
+                shutil.copy2(src, dst)
+
+    # Copy metadata files
+    for meta_file in ("manifest.json", "status.json", "checkpoint.json",
+                      "fill_complete.json", "readme.txt"):
+        for run in group:
+            src = os.path.join(run.path, meta_file)
+            if os.path.exists(src):
+                dst = os.path.join(merged_dir, meta_file)
+                shutil.copy2(src, dst)
+                break  # only first found
+
+    # Write marker txt (empty)
+    marker_path = os.path.join(merged_dir, f"{name}.txt")
+    with open(marker_path, "w", encoding="utf-8") as f:
+        pass  # empty — name IS the metadata
+
+    # Move original fragments into _fragments/
+    for run in group:
+        dst = os.path.join(fragments_dir, run.id)
+        if os.path.exists(run.path):
+            shutil.move(run.path, dst)
+
+    return merged_dir
+
+
+def _move_junk(junk_runs: list, base_dir: str, dry_run: bool = False):
+    """Move junk runs to _junk/ directory."""
+    junk_dir = os.path.join(base_dir, JUNK_DIR_NAME)
+    if not dry_run:
+        os.makedirs(junk_dir, exist_ok=True)
+    for run in junk_runs:
+        if dry_run:
+            print(f"  [DRY-RUN] Move {run.id} → {JUNK_DIR_NAME}/")
+        else:
+            dst = os.path.join(junk_dir, run.id)
+            if os.path.exists(run.path):
+                import shutil
+                shutil.move(run.path, dst)
+                print(f"  Moved {run.id} → {JUNK_DIR_NAME}/")
+
+
+# =========================================================================
+# CLI
+# =========================================================================
+
+def main():
+    import argparse
+    import config
+
+    parser = argparse.ArgumentParser(
+        description="YBCO 实验数据整合工具 — 扫描、去重、合并碎片化数据")
+    parser.add_argument("--base-dir",
+                        default=getattr(config, "experiment_data_base_dir",
+                                       os.path.join(
+                                           os.path.dirname(__file__),
+                                           "experiment_data")),
+                        help="实验数据根目录")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="预览模式，不执行任何实际操作")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="跳过所有确认提示，自动执行")
+    args = parser.parse_args()
+
+    base_dir = os.path.abspath(args.base_dir)
+    if not os.path.isdir(base_dir):
+        print(f"错误: 目录不存在 — {base_dir}")
+        return 1
+
+    print(f"=== 扫描 {base_dir} ===")
+
+    # --- Scan ---
+    runs = []
+    skipped = 0
+    for entry in os.listdir(base_dir):
+        full = os.path.join(base_dir, entry)
+        if not os.path.isdir(full):
+            # Skip files (zips etc)
+            continue
+        info = scan_run(full)
+        if info is None:
+            skipped += 1
+            continue
+        runs.append(info)
+
+    print(f"Found {len(runs)} runs, {skipped} skipped "
+          f"(already consolidated or special dirs)")
+
+    # --- Junk ---
+    junk = [r for r in runs if is_junk(r)]
+    non_junk = [r for r in runs if not is_junk(r)]
+
+    if junk:
+        print(f"\n--- Junk Candidates ({len(junk)}) ---")
+        for j in junk:
+            print(f"  {j.id} ({j.s2p_count} s2p, "
+                  f"manifest={j.has_manifest}, status={j.has_status})")
+
+        if not args.yes:
+            ans = input("\nMove all to _junk/? [Y/n]: ").strip().lower()
+            if ans and ans != "y":
+                print("Skipped junk cleanup.")
+                junk = []
+        if junk:
+            _move_junk(junk, base_dir, dry_run=args.dry_run)
+            if args.dry_run:
+                print(f"  [DRY-RUN] Would move {len(junk)} runs to _junk/")
+            else:
+                print(f"  Moved {len(junk)} runs to _junk/")
+
+    # --- Group ---
+    groups = group_runs(non_junk)
+    print(f"\n--- Consolidation Groups ({len(groups)}) ---")
+
+    for i, group in enumerate(groups):
+        # Determine total s2p after dedup
+        kept, warnings = resolve_conflicts(group)
+        kept, removed_far = clean_far_target(kept)
+
+        name = build_consolidated_name(group, len(kept))
+        all_temps = set()
+        for r in group:
+            all_temps.update(r.target_temps)
+        min_t = int(min(all_temps)) if all_temps else 0
+        max_t = int(max(all_temps)) if all_temps else 0
+
+        pv = group[0].vna_power_plan
+        pl = group[0].laser_power_plan
+        pv_str = f"[{min(pv):g}..{max(pv):g}]" if pv else "?"
+        pl_str = f"[{min(pl):g}..{max(pl):g}]" if pl else "?"
+
+        print(f"\nGroup {chr(65+i)}: Pv={pv_str}, Pl={pl_str}, "
+              f"T=[{min_t}..{max_t}] → {len(kept)}pts")
+        print(f"  Fragments:")
+        for r in sorted(group, key=lambda x: (x.timestamp or datetime.min).replace(tzinfo=None)):
+            rt = sorted(r.target_temps) if r.target_temps else []
+            t_range = f"{min(rt):g}-{max(rt):g}K" if rt else "no data"
+            print(f"    {r.id}  T={t_range}  {r.s2p_count} s2p")
+
+        if warnings:
+            print(f"  Warnings:")
+            for w in warnings:
+                print(f"    {w}")
+
+        if removed_far:
+            print(f"  Far-target to delete: {len(removed_far)} files (Δ > 1K)")
+
+        print(f"  → {name}")
+
+        if not args.yes:
+            ans = input(f"  Merge? [Y/n/skip]: ").strip().lower()
+            if ans == "skip":
+                print("  Skipped.")
+                continue
+            if ans and ans != "y":
+                print("  Skipped.")
+                continue
+
+        # Execute
+        if args.dry_run:
+            print(f"  [DRY-RUN] Would merge → {MERGED_DIR_NAME}/{name}")
+            if removed_far:
+                print(f"  [DRY-RUN] Would delete {len(removed_far)} far-target files")
+        else:
+            # Delete far-target files
+            for f in removed_far:
+                # Find and delete
+                for run in group:
+                    candidate = os.path.join(run.path, f.path)
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                        break
+
+            merged_path = _merge_group(group, kept, base_dir)
+            print(f"  Merged → {os.path.relpath(merged_path, base_dir)}")
+
+    print(f"\n=== Done ===")
+    merged_count = len(os.listdir(os.path.join(base_dir, MERGED_DIR_NAME))) \
+        if os.path.isdir(os.path.join(base_dir, MERGED_DIR_NAME)) else 0
+    print(f"Groups merged: {merged_count}")
+    if junk:
+        print(f"Junk moved: {len(junk)}")
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())

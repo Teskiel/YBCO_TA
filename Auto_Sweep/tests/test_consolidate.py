@@ -304,3 +304,58 @@ class TestCleanFarTarget:
         assert len(kept) == 1
         assert kept[0].path == "a.s2p"
         assert len(removed) == 1
+
+
+class TestBuildConsolidatedName:
+    """文件夹命名规则: {first_date}-{last_date}__{minT}-{maxT}K__{N}pts"""
+
+    def test_given_single_run_when_build_name_then_same_date(self):
+        from consolidate import build_consolidated_name, RunInfo
+        from datetime import datetime
+
+        r = RunInfo(id="20260618_150520", path="/tmp/x")
+        r.timestamp = datetime(2026, 6, 18, 15, 5, 20)
+        r.target_temps = {40.0, 50.0, 60.0}
+
+        name = build_consolidated_name([r], 120)
+        assert name == "20260618-0618__40-60K__120pts"
+
+    def test_given_multi_run_when_build_name_then_date_range(self):
+        from consolidate import build_consolidated_name, RunInfo
+        from datetime import datetime
+
+        r1 = RunInfo(id="20260611_115038", path="/tmp/x")
+        r1.timestamp = datetime(2026, 6, 11, 11, 50, 38)
+        r1.target_temps = {10.0, 20.0}
+
+        r2 = RunInfo(id="20260614_012513", path="/tmp/x")
+        r2.timestamp = datetime(2026, 6, 14, 1, 25, 13)
+        r2.target_temps = {70.0, 80.0}
+
+        name = build_consolidated_name([r1, r2], 376)
+        assert name == "20260611-0614__10-80K__376pts"
+        assert name.endswith(".txt") is False  # name only, .txt added later
+
+
+class TestIsAlreadyConsolidated:
+    """已整合的目录被跳过。"""
+
+    def test_given_marker_txt_when_check_then_consolidated(self):
+        from consolidate import _is_already_consolidated
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Create a marker-like txt file
+            marker = os.path.join(
+                tmp, "20260611-0614__10-80K__376pts.txt")
+            with open(marker, "w") as f:
+                pass  # empty file
+
+            assert _is_already_consolidated(tmp) is True
+
+    def test_given_no_marker_when_check_then_not_consolidated(self):
+        from consolidate import _is_already_consolidated
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assert _is_already_consolidated(tmp) is False
