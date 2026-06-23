@@ -229,3 +229,98 @@ def scan_run(dir_path: str) -> Optional[RunInfo]:
                 pass
 
     return info
+
+
+# =========================================================================
+# Junk classification
+# =========================================================================
+
+JUNK_MAX_S2P = 5
+
+
+def is_junk(run: RunInfo) -> bool:
+    """A run is junk if it has very few s2p files AND no metadata.
+
+    These are typically failed starts, empty shells, or aborted runs
+    that produced no meaningful data.
+    """
+    has_metadata = run.has_manifest or run.has_status
+    return run.s2p_count <= JUNK_MAX_S2P and not has_metadata
+
+
+# =========================================================================
+# Grouping
+# =========================================================================
+
+def _infer_temp_step(temps: set) -> float:
+    """Infer the temperature step size from a set of temperatures.
+
+    Defaults to 2 K if inference is not possible.
+    """
+    if len(temps) < 2:
+        return 2.0
+    sorted_t = sorted(temps)
+    diffs = [sorted_t[i + 1] - sorted_t[i] for i in range(len(sorted_t) - 1)]
+    if not diffs:
+        return 2.0
+    # Use the most common diff as the step size
+    from collections import Counter
+    return Counter(diffs).most_common(1)[0][0]
+
+
+def _temps_are_adjacent(a: set, b: set, max_gap_steps: int = 1) -> bool:
+    """Check if two temperature sets are adjacent or overlapping.
+
+    Adjacent means the gap between the closest temperatures across
+    the two sets is <= max_gap_steps * step_size.
+    """
+    if not a or not b:
+        # If one has no temps, still group — it might be a metadata-only fragment
+        return True
+    if a & b:
+        return True  # overlapping
+    a_sorted = sorted(a)
+    b_sorted = sorted(b)
+    step = min(_infer_temp_step(a), _infer_temp_step(b))
+    max_gap = max_gap_steps * step
+    # Check all pairwise gaps
+    for ta in a_sorted:
+        for tb in b_sorted:
+            if abs(ta - tb) <= max_gap:
+                return True
+    return False
+
+
+def group_runs(runs: list) -> list[list]:
+    """Group RunInfo objects by matching params AND adjacent/overlapping temps.
+
+    Returns a list of groups, where each group is a list of RunInfo.
+    """
+    if not runs:
+        return []
+
+    # Sort by timestamp for stable grouping
+    sorted_runs = sorted(runs, key=lambda r: (
+        r.params_hash,
+        min(r.target_temps) if r.target_temps else float("inf"),
+        r.timestamp.isoformat() if r.timestamp else "",
+    ))
+
+    groups = []
+    for run in sorted_runs:
+        placed = False
+        for group in groups:
+            rep = group[0]  # representative
+            if rep.params_hash == run.params_hash:
+                # Same parameters — check temperature adjacency
+                if _temps_are_adjacent(rep.target_temps, run.target_temps):
+                    # Merge target temps into the representative for
+                    # transitive grouping (A-B adjacent, B-C adjacent → all one group)
+                    rep.target_temps = rep.target_temps | run.target_temps
+                    group.append(run)
+                    placed = True
+                    break
+        if not placed:
+            groups.append([run])
+
+    return groups

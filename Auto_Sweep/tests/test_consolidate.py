@@ -90,3 +90,99 @@ class TestScanRun:
             assert info is not None
             assert info.s2p_count == 0
             assert not info.has_manifest
+
+
+class TestIsJunk:
+    """is_junk 判定空壳/失败启动。"""
+
+    def test_given_no_s2p_and_no_metadata_when_is_junk_then_true(self):
+        from consolidate import is_junk, RunInfo
+        info = RunInfo(id="empty", path="/tmp/empty")
+        info.s2p_count = 0
+        info.has_manifest = False
+        info.has_status = False
+        assert is_junk(info) is True
+
+    def test_given_few_s2p_and_no_metadata_when_is_junk_then_true(self):
+        from consolidate import is_junk, RunInfo
+        info = RunInfo(id="tiny", path="/tmp/tiny")
+        info.s2p_count = 3
+        info.has_manifest = False
+        info.has_status = False
+        assert is_junk(info) is True
+
+    def test_given_few_s2p_but_has_manifest_when_is_junk_then_false(self):
+        from consolidate import is_junk, RunInfo
+        info = RunInfo(id="tiny_but_real", path="/tmp/tiny")
+        info.s2p_count = 2
+        info.has_manifest = True
+        assert is_junk(info) is False
+
+    def test_given_many_s2p_when_is_junk_then_false(self):
+        from consolidate import is_junk, RunInfo
+        info = RunInfo(id="big", path="/tmp/big")
+        info.s2p_count = 50
+        info.has_manifest = False
+        assert is_junk(info) is False
+
+
+class TestGroupRuns:
+    """group_runs 按 (Pv, Pl) 一致 + 温度相邻/重叠 分组。"""
+
+    def test_given_same_params_contiguous_temps_when_group_then_one_group(self):
+        """相同参数、温度互补的碎片归为一组。"""
+        from consolidate import group_runs, RunInfo
+
+        r1 = RunInfo(id="run1", path="/tmp/run1")
+        r1.params_hash = "abc123"
+        r1.target_temps = {10.0, 12.0, 14.0}
+        r1.vna_power_plan = [-55, -45]
+        r1.laser_power_plan = [0, 5]
+
+        r2 = RunInfo(id="run2", path="/tmp/run2")
+        r2.params_hash = "abc123"
+        r2.target_temps = {16.0, 18.0, 20.0}
+        r2.vna_power_plan = [-55, -45]
+        r2.laser_power_plan = [0, 5]
+
+        groups = group_runs([r1, r2])
+        assert len(groups) == 1
+        assert len(groups[0]) == 2
+
+    def test_given_different_params_when_group_then_separate_groups(self):
+        """不同参数分开。"""
+        from consolidate import group_runs, RunInfo
+
+        r1 = RunInfo(id="run1", path="/tmp/run1")
+        r1.params_hash = "aaa111"
+        r1.target_temps = {50.0}
+        r1.vna_power_plan = [-55, -45]
+        r1.laser_power_plan = [0, 5]
+
+        r2 = RunInfo(id="run2", path="/tmp/run2")
+        r2.params_hash = "bbb222"
+        r2.target_temps = {50.0}
+        r2.vna_power_plan = [-45, -35]  # different VNA range
+        r2.laser_power_plan = [0, 5]
+
+        groups = group_runs([r1, r2])
+        assert len(groups) == 2
+
+    def test_given_same_params_large_temp_gap_when_group_then_separate(self):
+        """温度差距超过 1 个 step 的数据分开。"""
+        from consolidate import group_runs, RunInfo
+
+        r1 = RunInfo(id="run1", path="/tmp/run1")
+        r1.params_hash = "same"
+        r1.target_temps = {10.0, 12.0}
+        r1.vna_power_plan = [-55]
+        r1.laser_power_plan = [0]
+
+        r2 = RunInfo(id="run2", path="/tmp/run2")
+        r2.params_hash = "same"
+        r2.target_temps = {50.0, 52.0}  # gap from 12 to 50 >> 2 steps
+        r2.vna_power_plan = [-55]
+        r2.laser_power_plan = [0]
+
+        groups = group_runs([r1, r2])
+        assert len(groups) == 2  # gap too large, separate groups
