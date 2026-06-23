@@ -1637,6 +1637,22 @@ class ExperimentWorker(QObject):
             _log(f"激光功率列表: {self._power_list} mW")
             _log(f"VNA 功率列表: {self._vna_power_list} dBm")
 
+            # ---- 写入 manifest.json（供数据整合工具使用） ----
+            try:
+                import json as _json
+                manifest = {
+                    "experiment_id": os.path.basename(self._output_dir),
+                    "start_time": start_time.isoformat(),
+                    "temperature_plan": self._temp_list,
+                    "vna_power_plan": self._vna_power_list,
+                    "laser_power_plan": self._power_list,
+                }
+                manifest_path = os.path.join(self._output_dir, "manifest.json")
+                with open(manifest_path, "w", encoding="utf-8") as _f:
+                    _json.dump(manifest, _f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass  # manifest 写入失败不影响实验
+
             # ---- 初始内存状态 + 进程诊断 ----
             if mem_monitor:
                 info = mem_monitor.check()
