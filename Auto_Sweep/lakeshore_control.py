@@ -129,6 +129,207 @@ class LakeShore335:
         except Exception:
             pass
 
+    def reconnect(self) -> bool:
+        """重新连接 VISA 会话（用于 GPIB/USB 连接丢失后的恢复）。
+
+        关闭旧会话，重新打开资源，恢复串口参数。
+        失败时返回 False，调用方可据此决定是否重试。
+
+        Returns:
+            True 如果重连成功，False 如果失败。
+        """
+        import time
+
+        # 1. 关闭旧会话
+        try:
+            self.device.close()
+        except Exception:
+            pass
+
+        # 2. 短暂延迟让硬件复位
+        time.sleep(1.0)
+
+        # 3. 重新打开资源
+        try:
+            self.device = self.resource_manager.open_resource(self.visa_address)
+        except Exception:
+            return False
+
+        # 4. 恢复串口参数
+        try:
+            if "ASRL" in self.visa_address.upper():
+                self.device.baud_rate = 57600
+                self.device.data_bits = 7
+                self.device.parity = pyvisa.constants.Parity.odd
+                self.device.stop_bits = pyvisa.constants.StopBits.one
+                self.device.timeout = 3000
+                self.device.read_termination = "\n"
+                self.device.write_termination = "\n"
+            else:
+                self.device.timeout = 3000
+                self.device.read_termination = "\n"
+                self.device.write_termination = "\n"
+
+            # 5. 验证连接 — 尝试读取身份
+            self.identity = self.device.query("*IDN?").strip()
+            return True
+        except Exception:
+            return False
+
+    def hard_reconnect(self) -> bool:
+        """深度重连：重建整个 PyVISA ResourceManager（用于驱动进程被 OOM 杀后恢复）。
+
+        当普通 reconnect() 失败时调用此方法 — 关闭 ResourceManager，
+        创建全新的 VISA 资源管理器实例，重新打开设备。
+
+        Returns:
+            True 如果深度重连成功，False 如果失败。
+        """
+        import time
+        import gc
+
+        # 1. 彻底关闭旧连接
+        try:
+            self.device.close()
+        except Exception:
+            pass
+
+        # 2. 关闭旧的 ResourceManager
+        try:
+            self.resource_manager.close()
+        except Exception:
+            pass
+
+        # 3. 强制 GC 释放旧 VISA 资源
+        gc.collect()
+        time.sleep(2.0)
+
+        # 4. 创建全新的 ResourceManager
+        try:
+            self.resource_manager = pyvisa.ResourceManager()
+        except Exception:
+            return False
+
+        # 5. 重新打开设备
+        try:
+            self.device = self.resource_manager.open_resource(self.visa_address)
+        except Exception:
+            return False
+
+        # 6. 恢复串口参数
+        try:
+            if "ASRL" in self.visa_address.upper():
+                self.device.baud_rate = 57600
+                self.device.data_bits = 7
+                self.device.parity = pyvisa.constants.Parity.odd
+                self.device.stop_bits = pyvisa.constants.StopBits.one
+                self.device.timeout = 3000
+                self.device.read_termination = "\n"
+                self.device.write_termination = "\n"
+            else:
+                self.device.timeout = 3000
+                self.device.read_termination = "\n"
+                self.device.write_termination = "\n"
+
+            self.identity = self.device.query("*IDN?").strip()
+            return True
+        except Exception:
+            return False
+
+    def probe_connection(self) -> bool:
+        """主动探测 VISA 连接是否存活。
+
+        发送 *IDN? 查询验证双向通信。与 get_temperature_safe 不同，
+        此方法不读取温度，仅验证连接活性，开销更小。
+
+        Returns:
+            True 如果连接正常，False 如果已断开。
+        """
+        try:
+            result = self.device.query("*IDN?")
+            return bool(result and result.strip())
+        except Exception:
+            return False
+
+    def get_temperature_safe(self, channel: str = "A",
+                             retries: int = 2,
+                             retry_delay_s: float = 3.0) -> float | None:
+        """安全读取温度，含自动重试 + 陈旧数据检测 + 深度重连。
+
+        三级升级策略：
+          1. 轻微故障: 等待 retry_delay_s 后重试
+          2. 持续故障: 调用 reconnect() 重置 VISA 会话
+          3. 重连失败: 调用 hard_reconnect() 重建 ResourceManager
+
+        同时追踪连续相同返回值 — 如果连续 3 次返回完全相同的值
+        （浮点相等），视为陈旧数据，触发主动探测 + 重连。
+
+        Args:
+            channel: 输入通道 (A/B/C/D)
+            retries: 重试次数（默认 2）
+            retry_delay_s: 重试前等待秒数（默认 3.0）
+
+        Returns:
+            温度值 (K) 或 None
+        """
+        import time
+
+        # 陈旧数据追踪（模块级：跨调用持久）
+        if not hasattr(self, "_stale_tracker"):
+            self._stale_tracker = {"last_value": None, "count": 0,
+                                   "_consecutive_none": 0}
+
+        for attempt in range(retries + 1):
+            try:
+                value = float(self.query(f"KRDG? {channel}"))
+
+                # --- 陈旧数据检测 ---
+                last = self._stale_tracker["last_value"]
+                if last is not None and value == last:
+                    self._stale_tracker["count"] += 1
+                    if self._stale_tracker["count"] >= 3:
+                        # 连续 3 次相同值 → 可能是缓冲回放，触发主动探测
+                        self._stale_tracker["count"] = 0
+                        if not self.probe_connection():
+                            # 连接确实断了 → 触发重连
+                            if not self.reconnect():
+                                self.hard_reconnect()
+                            # 重连后重新读取
+                            time.sleep(retry_delay_s)
+                            continue
+                else:
+                    self._stale_tracker["last_value"] = value
+                    self._stale_tracker["count"] = 0
+
+                self._stale_tracker["_consecutive_none"] = 0
+                return value
+
+            except Exception:
+                self._stale_tracker["_consecutive_none"] += 1
+
+                if attempt < retries:
+                    time.sleep(retry_delay_s)
+                    # 第 1 次失败 → reconnect; 第 2 次 → hard_reconnect
+                    if attempt == retries - 2:
+                        if not self.reconnect():
+                            self.hard_reconnect()
+                    elif attempt == retries - 1:
+                        self.hard_reconnect()
+                else:
+                    # 全部重试+重连失败
+                    self._stale_tracker["last_value"] = None
+                    self._stale_tracker["count"] = 0
+                    return None
+
+        return None
+
+    @property
+    def consecutive_read_failures(self) -> int:
+        """返回 get_temperature_safe 连续返回 None 的次数。"""
+        if not hasattr(self, "_stale_tracker"):
+            return 0
+        return self._stale_tracker.get("_consecutive_none", 0)
+
 
 # =========================================================================
 # Duck-typing helper functions
@@ -242,14 +443,25 @@ def set_lakeshore_pid(temp_reader, p: float, i: float, d: float):
 def get_lakeshore_temperature(temp_reader) -> float:
     """Read temperature from *any* LakeShore driver.
 
-    Tries ``.get_temperature()`` first, then raw ``KRDG? A`` query.
-    Returns None if both fail.
+    Tries ``.get_temperature_safe()`` first (含自动重试+重连),
+    then ``.get_temperature()``, then raw ``KRDG? A`` query.
+    Returns None if all fail.
     """
+    # 优先使用安全方法（含自动重试+重连）
+    try:
+        result = temp_reader.get_temperature_safe()
+        if result is not None:
+            return result
+    except Exception:
+        pass
+
+    # 兼容旧版 get_temperature()
     try:
         return float(temp_reader.get_temperature())
     except Exception:
         pass
 
+    # 原始 VISA 查询
     try:
         return float(temp_reader.query("KRDG? A"))
     except Exception:

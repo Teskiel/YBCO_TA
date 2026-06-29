@@ -332,7 +332,12 @@ def main():
         args.output.write_text(output, encoding="utf-8")
         print(f"报告已写入 {args.output}")
     else:
-        print(output)
+        try:
+            print(output)
+        except UnicodeEncodeError:
+            import io
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+            print(output)
 
 
 if __name__ == "__main__":

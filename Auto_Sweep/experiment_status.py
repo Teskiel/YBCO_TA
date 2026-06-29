@@ -57,7 +57,7 @@ class ExperimentStatusWriter:
                       laser_power_plan: list,
                       runtime_params: dict) -> bool:
         """实验开始时调用，写入完整初始化状态。"""
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        now = datetime.now(timezone.utc).isoformat()
         data = {
             "experiment_id": experiment_id,
             "status": "running",
@@ -104,7 +104,7 @@ class ExperimentStatusWriter:
             current["phase"] = phase
 
         data["current"] = current
-        data["last_update"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        data["last_update"] = datetime.now(timezone.utc).isoformat()
         return self._save(data)
 
     def add_completed(self, target_k: float, vna_dbm: float,
@@ -120,7 +120,7 @@ class ExperimentStatusWriter:
             "powers_mw": powers_mw,
             "status": status,
         })
-        data["last_update"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        data["last_update"] = datetime.now(timezone.utc).isoformat()
         return self._save(data)
 
     def add_issue(self, target_k: float, issue_type: str,
@@ -131,13 +131,13 @@ class ExperimentStatusWriter:
             return False
 
         data.setdefault("issues", []).append({
-            "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "time": datetime.now(timezone.utc).isoformat(),
             "target_k": target_k,
             "type": issue_type,
             "detail": detail,
             "restart_count": restart_count,
         })
-        data["last_update"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        data["last_update"] = datetime.now(timezone.utc).isoformat()
         return self._save(data)
 
     def add_skipped(self, target_k: float, reason: str,
@@ -152,7 +152,7 @@ class ExperimentStatusWriter:
             "reason": reason,
             "vna_power_remaining": vna_power_remaining,
         })
-        data["last_update"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        data["last_update"] = datetime.now(timezone.utc).isoformat()
         return self._save(data)
 
     def set_status(self, new_status: str) -> bool:
@@ -162,7 +162,7 @@ class ExperimentStatusWriter:
             return False
 
         data["status"] = new_status
-        data["last_update"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        data["last_update"] = datetime.now(timezone.utc).isoformat()
         return self._save(data)
 
 

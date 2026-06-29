@@ -9,10 +9,11 @@ Cryogenic systems are highly nonlinear: copper specific heat changes by
 orders of magnitude between 10K and 100K, and cooling power varies
 dramatically.  A single PID set cannot work across the full range.
 
-Three-zone scheme:
-  - Low  (≤ 20K): P=100, I=5,  D=0, Range=Low    — cryogenic safety
-  - Med  (20–40K): P=100, I=3,  D=0, Range=Medium — transitional
-  - High (> 40K):  P=150, I=0,  D=0, Range=Medium — high cooling power
+Four-zone scheme:
+  - Low       (≤ 20K):  P=100, I=5,  D=0, Range=Low    — cryogenic safety
+  - Med       (20–40K): P=100, I=3,  D=0, Range=Medium — transitional
+  - High      (40–70K): P=150, I=0,  D=0, Range=Medium — high cooling power
+  - Very High (> 70K):  P=150, I=0,  D=0, Range=Medium — 更强过冲 2.5K
 
 Heater range policy: Low + Medium only.  High is forbidden to protect
 the sample and heater element.
@@ -98,12 +99,22 @@ ZONES: Tuple[PIDZone, ...] = (
     PIDZone(
         zone_id=3,
         temp_min=40.0,
+        temp_max=70.0,
+        p=150.0,
+        i=0.0,
+        d=0.0,
+        heater_range=2,  # Medium (High forbidden)
+        description="高温区 40–70K: 沿用原方案 P=150/I=0, Med档, 较强过冲 2.0K",
+    ),
+    PIDZone(
+        zone_id=4,
+        temp_min=70.0,
         temp_max=999.0,  # effectively unlimited upper bound
         p=150.0,
         i=0.0,
         d=0.0,
         heater_range=2,  # Medium (High forbidden)
-        description="高温区 >40K: 沿用原方案 P=150/I=0, Med档, 较强过冲",
+        description="超高温区 >70K: P=150/I=0, Med档, 更强过冲 2.5K",
     ),
 )
 

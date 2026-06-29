@@ -179,6 +179,39 @@ class TemperatureSweepWidget(QWidget):
             "color: #8B949E; font-size: 11px; font-family: 'JetBrains Mono', 'Consolas', monospace;")
         root.addWidget(self._preview_label)
 
+        # ---- timing settings ----
+        import config
+        timing_box = QGroupBox("Timing Settings")
+        timing_layout = QVBoxLayout(timing_box)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Pre-measurement wait:"))
+        self._pre_wait_spin = QSpinBox()
+        self._pre_wait_spin.setRange(0, config.pre_measurement_wait_max_minutes)
+        self._pre_wait_spin.setValue(config.pre_measurement_wait_minutes)
+        self._pre_wait_spin.setSuffix(" min")
+        self._pre_wait_spin.setToolTip(
+            "温度稳定判定通过后、开始扫激光功率前的等待时间（0=关闭）")
+        self._pre_wait_spin.valueChanged.connect(self.settings_changed.emit)
+        row1.addWidget(self._pre_wait_spin)
+        row1.addStretch()
+        timing_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Max stability wait:"))
+        self._max_wait_spin = QSpinBox()
+        self._max_wait_spin.setRange(5, config.max_wait_max_minutes)
+        self._max_wait_spin.setValue(config.max_wait_seconds // 60)
+        self._max_wait_spin.setSuffix(" min")
+        self._max_wait_spin.setToolTip(
+            "单温度点最长等待时间（超过后强制继续或超时）")
+        self._max_wait_spin.valueChanged.connect(self.settings_changed.emit)
+        row2.addWidget(self._max_wait_spin)
+        row2.addStretch()
+        timing_layout.addLayout(row2)
+
+        root.addWidget(timing_box)
+
         # initial state
         self._on_mode_changed()
         self._update_preview()
@@ -252,12 +285,22 @@ class TemperatureSweepWidget(QWidget):
             return result
 
     def get_settings(self) -> dict:
+        timing = self.get_timing_settings()
         return {
             "mode": self.get_mode(),
             "fixed_temps": self.get_temperatures() if self._fixed_radio.isChecked() else [],
             "range_start": self._start_spin.value(),
             "range_stop": self._stop_spin.value(),
             "range_step": self._step_spin.value(),
+            "pre_wait_min": timing["pre_measurement_wait_min"],
+            "max_wait_min": timing["max_wait_min"],
+        }
+
+    def get_timing_settings(self) -> dict:
+        """Return current timing settings as (pre_wait_min, max_wait_min)."""
+        return {
+            "pre_measurement_wait_min": self._pre_wait_spin.value(),
+            "max_wait_min": self._max_wait_spin.value(),
         }
 
     def set_settings(self, s: dict):
@@ -275,6 +318,10 @@ class TemperatureSweepWidget(QWidget):
             self._fixed_input.setText(
                 ", ".join(str(int(t)) if t == int(t) else str(t)
                            for t in s["fixed_temps"]))
+        if "pre_wait_min" in s:
+            self._pre_wait_spin.setValue(int(s["pre_wait_min"]))
+        if "max_wait_min" in s:
+            self._max_wait_spin.setValue(int(s["max_wait_min"]))
         self._update_preview()
 
 
@@ -444,6 +491,10 @@ class DashboardPage(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(130)
+        # 限制最大行数，防止 QTextDocument 无限累积导致 OOM
+        import config
+        self.log_text.document().setMaximumBlockCount(
+            getattr(config, "log_max_blocks", 5000))
         log_layout.addWidget(self.log_text)
         root.addWidget(log_box)
 

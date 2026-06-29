@@ -41,14 +41,24 @@ temperature_levels_k = list(range(26, 101, 2))
 # =========================================================================
 
 stable_hold_seconds = 60             # must stay stable this long before measuring
-max_wait_seconds = 30 * 60           # 测量阶段最大等待 (30 min, Dashboard 可 override)
-max_wait_max_minutes = 120           # Dashboard max_wait 控件上限
+max_wait_seconds = 30 * 60           # 测量阶段默认最大等待 (30 min, Dashboard 可 override)
+max_wait_max_minutes = 180           # Dashboard max_wait 控件上限 (升至 3h)
 temperature_poll_seconds = 10        # polling interval (~6 readings/min)
+
+# ---- 各温度点的最大等待时间覆盖（秒） ----
+# 升温速率 ~0.2 K/min，50K→60K (10K) 需 ~50min，60K→70K 需 ~50min
+# 因此高温段设置更长超时，键为温度 (K)，值为 max_wait 秒数
+# None = 使用默认 max_wait_seconds
+max_wait_per_temperature_k = {
+    60.0: 60 * 60,    # 50→60K 升温: 60 min
+    70.0: 60 * 60,    # 60→70K 升温: 60 min
+    80.0: 60 * 60,    # 70→80K 升温: 60 min
+}
 
 custom_stability_settings = {
     "avg_window_seconds": 60,        # 1-minute rolling window
     "avg_tolerance_k": 1.0,          # average within ±1.0 K of setpoint
-    "delta_tolerance_k": 0.2,        # max drift over 2-minute span — 趋于平稳阈值
+    "delta_tolerance_k": 0.1,        # max drift over 2-minute span — 趋于平稳阈值
     "final_stable_band_k": 0.5,      # ±0.5 K 进入目标温度区间
     "min_readings_required": 8,      # 匹配 180s 回溯窗口（SPARSE 20s: 180/20=9, FINE 5s: 180/5=36, 8 兼顾两者）
 }
@@ -97,7 +107,8 @@ reconnect_delay_seconds = 2         # 重连前等待秒数
 FIXED_PID_ZONES = {
     "low":    {"max_temp": 20.0, "p": 100, "i": 5, "d": 0, "base_overshoot_k": 0.0},
     "medium": {"max_temp": 40.0, "p": 100, "i": 0, "d": 0, "base_overshoot_k": 2.0},
-    "high":   {"max_temp": float("inf"), "p": 150, "i": 0, "d": 0, "base_overshoot_k": 2.0},
+    "high":   {"max_temp": 70.0, "p": 150, "i": 0, "d": 0, "base_overshoot_k": 2.0},
+    "very_high": {"max_temp": float("inf"), "p": 150, "i": 0, "d": 0, "base_overshoot_k": 2.5},
 }
 
 stability_fallback_settings = {
@@ -131,8 +142,12 @@ memory_warning_threshold_mb = 8192       # 可用内存低于 8 GB 时警告
 memory_critical_threshold_mb = 4096      # 可用内存低于 4 GB 时严重告警
 memory_check_interval_s = 60             # 长时间等待期间每隔 60 秒检查一次内存
 memory_auto_pause_threshold_mb = 3072    # 可用内存低于 3 GB 时自动暂停实验，等待恢复
+memory_early_warning_percent = 80         # 内存使用率超过此百分比时触发早期预警（自动保存 checkpoint）
+memory_graceful_exit_threshold_mb = 2048  # 可用内存低于 2 GB 时优雅退出（保存 checkpoint 后终止）
 memory_process_diag_enabled = True       # 实验启动时输出系统 Top-5 内存消耗进程
 long_experiment_warning_hours = 2.0      # 实验超过此时长后，完成时提示建议重启 GUI
+post_experiment_zombie_cleanup = True     # 实验结束后自动清理僵尸 Python 进程
+post_experiment_restart_recommend = True  # 实验结束后强制建议重启 GUI（内存 > 60% 时）
 log_max_blocks = 5000                    # GUI 日志控件最大保留行数（防止 QTextEdit OOM）
 
 # =========================================================================

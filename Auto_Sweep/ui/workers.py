@@ -170,9 +170,10 @@ class LaserWorker(QObject):
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, resource_manager=None):
         super().__init__()
         self._laser = None
+        self._resource_manager = resource_manager
 
     @pyqtSlot(str)
     def connect_device(self, address: str):
@@ -265,9 +266,10 @@ class LakeShoreWorker(QObject):
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, resource_manager=None):
         super().__init__()
         self._controller = None
+        self._resource_manager = resource_manager
 
     @pyqtSlot(str)
     def connect_device(self, address: str):
@@ -433,10 +435,10 @@ class VNAWorker(QObject):
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, resource_manager=None):
         super().__init__()
         self._vna = None
-        self._rm = None           # keep ResourceManager alive
+        self._rm = resource_manager  # use shared ResourceManager (or create own)
 
     # ---- connection -------------------------------------------------
 
@@ -444,7 +446,8 @@ class VNAWorker(QObject):
     def connect_device(self, address: str):
         try:
             import pyvisa
-            self._rm = pyvisa.ResourceManager("visa32.dll")
+            if self._rm is None:
+                self._rm = pyvisa.ResourceManager("visa32.dll")
             self._vna = self._rm.open_resource(address)
             self._vna.timeout = 120000
             idn = self._vna.query("*IDN?").strip()
@@ -776,6 +779,42 @@ class CheckpointManager:
 # ExperimentWorker — full YBCO temperature + laser power sweep
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# Overshoot 学习增量持久化（模块级辅助函数）
+# ---------------------------------------------------------------------------
+
+def _save_overshoot_learning_incremental(learning: dict,
+                                         caller_file: str,
+                                         log_fn=None) -> None:
+    """增量保存 overshoot 学习数据到 app_settings.json（原子写入）。"""
+    if not learning:
+        return
+    try:
+        import json as _json
+        import os as _os
+        _settings_path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(caller_file)),
+            "app_settings.json")
+        _settings = {}
+        if _os.path.exists(_settings_path):
+            with open(_settings_path, "r", encoding="utf-8") as _f:
+                _settings = _json.load(_f)
+        _settings["overshoot_learning"] = {
+            str(k): v for k, v in learning.items()}
+        _tmp_path = _settings_path + ".tmp"
+        with open(_tmp_path, "w", encoding="utf-8") as _f:
+            _json.dump(_settings, _f, indent=2, ensure_ascii=False)
+        _os.replace(_tmp_path, _settings_path)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# ExperimentWorker — full YBCO temperature + laser power sweep
+# ---------------------------------------------------------------------------
+
 class ExperimentWorker(QObject):
     """Runs the temperature-and-power sweep experiment on a background thread.
 
@@ -859,6 +898,18 @@ class ExperimentWorker(QObject):
         self._abort_flag = True
         self.progress.emit("Abort requested — finishing current step...")
 
+    def _read_temperature_safe(self) -> Optional[float]:
+        """安全读取 LakeShore 温度，失败返回 None（不抛异常）。
+
+        用于快速预检等场景，调用者自行处理 None 返回值。
+        """
+        try:
+            if self._lakeshore_ctrl:
+                return self._lakeshore_ctrl.get_temperature("A")
+        except Exception:
+            pass
+        return None
+
     def _apply_setpoint_adjustment(self, new_setpoint: float, overshoot: float,
                                      base_overshoot: float, actual_k: float = 0):
         """将新的设定点写入 LakeShore（仅调整设定点，不修改 PID）。
@@ -917,9 +968,11 @@ class ExperimentWorker(QObject):
             return True
 
         # 连接断开关键字（大小写不敏感）
+        # 注意：移除了 "timeout"——正常 VISA 超时不应触发完整 recovery，
+        # 由稳定性循环的连续失败计数器处理
         recoverable_keywords = [
-            "timeout", "disconnected", "closed", "lost",
-            "not responding", "connection", "tcpip", "hislip",
+            "disconnected", "closed", "lost",
+            "not responding", "connection",
         ]
         msg_lower = msg.lower()
         for kw in recoverable_keywords:
@@ -1743,6 +1796,26 @@ class ExperimentWorker(QObject):
                     self.progress.emit("用户取消恢复，实验不启动")
                     temp_idx = len(self._temp_list)  # 跳过所有温度点
 
+            # ---- 合并 checkpoint overshoot 学习数据 ----
+            _chkpt_overshoot = getattr(
+                self, "_checkpoint_overshoot", {})
+            if _chkpt_overshoot:
+                _merged_count = 0
+                for _ck_k, _ck_v in _chkpt_overshoot.items():
+                    if _ck_k not in _overshoot_learning:
+                        _overshoot_learning[_ck_k] = _ck_v
+                        _merged_count += 1
+                if _merged_count:
+                    _log(f"从 checkpoint 合并 overshoot 学习数据: "
+                         f"{_merged_count} 个温度点")
+                self._checkpoint_overshoot = dict(_overshoot_learning)
+
+            # ---- 恢复后第一个温度点标记（触发快速预检） ----
+            _is_first_temp_after_resume = (
+                checkpoint is not None
+                and getattr(self, "_resume_action", "cancel") == "resume"
+            )
+
             while temp_idx < len(self._temp_list):
                 target_k = self._temp_list[temp_idx]
 
@@ -1772,6 +1845,22 @@ class ExperimentWorker(QObject):
                 except Exception as e:
                     _log(f"  ⚠ 初始温度读取失败: {e}，使用 target={target_k:.1f}K 作为回退")
 
+                # ---- 快速预检（恢复后第一个温度点） ----
+                _is_fast_track = False
+                if _is_first_temp_after_resume:
+                    _is_first_temp_after_resume = False
+                    from stability_monitor import AdvancedStabilityMonitor as _ASM
+                    _log(f"  恢复后快速预检 @ {target_k:.1f}K ...")
+                    _check_result = _ASM.fast_stability_check(
+                        lambda: self._read_temperature_safe(), target_k)
+                    _log(f"  快速预检结果: skip_overshoot={_check_result['skip_overshoot']}, "
+                         f"reason={_check_result['reason']}, "
+                         f"avg_temp={_check_result.get('avg_temp', 'N/A')}, "
+                         f"elapsed={_check_result.get('elapsed_s', 0):.0f}s")
+                    if _check_result["skip_overshoot"]:
+                        _is_fast_track = True
+                        _log(f"  温度已稳定，跳过 overshoot，直接快速稳判")
+
                 # ---- 初始化稳定性控制器 ----
                 from ui.experiment_stability_controller import (
                     ExperimentStabilityController,
@@ -1796,15 +1885,24 @@ class ExperimentWorker(QObject):
                         fixed_pid["p"], fixed_pid["i"], fixed_pid["d"], loop=1)
 
                 # ---- 写入初始设定点 ----
-                setpoint_k = stability_ctrl.needs_setpoint_adjustment()
-                if self._lakeshore_ctrl and setpoint_k is not None:
-                    self._lakeshore_ctrl.set_temperature(setpoint_k, loop=1)
-                    overshoot_info = ""
-                    if stability_ctrl.current_overshoot > 0.01:
-                        overshoot_info = f" (overshoot +{stability_ctrl.current_overshoot:.1f}K)"
+                if _is_fast_track:
+                    stability_ctrl.force_skip_overshoot()
+                    if self._lakeshore_ctrl:
+                        self._lakeshore_ctrl.set_temperature(target_k, loop=1)
                     _log(f"  温区 PID: P={fixed_pid['p']:g}/"
                          f"I={fixed_pid['i']:g}/D={fixed_pid['d']:g}, "
-                         f"设定点 → {setpoint_k:.3f} K{overshoot_info}")
+                         f"设定点 → {target_k:.3f} K [快速预检: 跳过 overshoot]")
+                else:
+                    setpoint_k = stability_ctrl.needs_setpoint_adjustment()
+                    if self._lakeshore_ctrl and setpoint_k is not None:
+                        self._lakeshore_ctrl.set_temperature(setpoint_k, loop=1)
+                        overshoot_info = ""
+                        if stability_ctrl.current_overshoot > 0.01:
+                            overshoot_info = (f" (overshoot "
+                                             f"+{stability_ctrl.current_overshoot:.1f}K)")
+                        _log(f"  温区 PID: P={fixed_pid['p']:g}/"
+                             f"I={fixed_pid['i']:g}/D={fixed_pid['d']:g}, "
+                             f"设定点 → {setpoint_k:.3f} K{overshoot_info}")
 
                 # ---- 等待稳定性（2 阶段轮询） ----
                 _temp_skip_measurement = False
@@ -1812,6 +1910,7 @@ class ExperimentWorker(QObject):
                 start_t = _time.time()
                 prev_phase = "sparse"
                 last_mem_check = 0.0
+                _read_failures = 0              # 连续温度读取失败计数
 
                 while True:
                     if self._abort_flag:
@@ -1819,11 +1918,27 @@ class ExperimentWorker(QObject):
                         log_file.close()
                         return
 
+                    # 始终计算 elapsed，即使读取失败也推进超时计时
+                    elapsed = _time.time() - start_t
+
                     # 读取温度
                     try:
                         actual_k = self._lakeshore_ctrl.get_temperature("A") \
                             if self._lakeshore_ctrl else target_k
-                    except Exception:
+                        _read_failures = 0  # 成功后重置
+                    except Exception as _read_exc:
+                        _read_failures += 1
+                        if _read_failures >= 5:
+                            _log(f"  ⛔ 温度读取连续失败 {_read_failures} 次，"
+                                 f"触发断点续传: {_read_exc}")
+                            # 传播到 run() → _enter_recovery()
+                            raise
+                        if _read_failures == 1:
+                            _log(f"  ⚠ 温度读取失败 ({_read_exc})，"
+                                 f"重试中...")
+                        else:
+                            _log(f"  ⚠ 连续失败 {_read_failures}/5 次: "
+                                 f"{_read_exc}")
                         _time.sleep(10)
                         continue
 
@@ -1834,7 +1949,6 @@ class ExperimentWorker(QObject):
                     stability_ctrl.add_reading(actual_k)
                     self.temperature_stabilizing.emit(target_k, actual_k)
 
-                    elapsed = _time.time() - start_t
                     result = stability_ctrl.check(elapsed)
 
                     # 阶段转换日志
@@ -1856,6 +1970,9 @@ class ExperimentWorker(QObject):
                             stability_ctrl.base_overshoot,
                             actual_k,
                         )
+
+                    # 冷却模式进度日志
+                    stability_ctrl.log_cooling_progress()
 
                     # 处理结果
                     if result.stable:
@@ -1881,6 +1998,21 @@ class ExperimentWorker(QObject):
                         _timeout_type = _rollback_state.classify_timeout(
                             result.avg_temp, target_k)
                         _delta = abs(result.avg_temp - target_k)
+
+                        # 冷却模式超时：冷却需要时间，不视为 hard_fail，
+                        # 使用更宽松的判定（即使 Δ > soft_pass_band 也尝试测量）
+                        _is_cooling_timeout = getattr(
+                            stability_ctrl, "is_cooling", False)
+                        if _is_cooling_timeout:
+                            _log(f"  冷却超时 @ {target_k:.1f}K — "
+                                 f"当前={result.avg_temp:.3f}K, "
+                                 f"Δ={_delta:.3f}K（冷却耗时超出预期），"
+                                 f"以当前温度继续测量")
+                            self.temperature_stable.emit(target_k, actual_k)
+                            _was_soft_pass = True
+                            _rollback_state.record_result(temp_idx, "soft_pass")
+                            break
+
                         if _timeout_type == "soft_pass":
                             _log(f"  超时软通过 @ {target_k:.1f}K — "
                                  f"avg={result.avg_temp:.3f}K, "
@@ -2415,6 +2547,9 @@ class ExperimentWorker(QObject):
                         stability_ctrl.record_result()
                         _overshoot_learning.update(
                             stability_ctrl.get_overshoot_learning())
+                        self._checkpoint_overshoot = dict(_overshoot_learning)
+                        _save_overshoot_learning_incremental(
+                            _overshoot_learning, __file__, _log)
                     except Exception:
                         pass  # stability_ctrl 可能已被外部重新赋值，安全忽略
 

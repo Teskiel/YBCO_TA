@@ -78,7 +78,8 @@ def parse_s2p_filename(filename: str) -> Optional[S2PFile]:
 # Special directories to skip during scanning
 # =========================================================================
 
-SKIP_DIRS = {"~merged", "_junk", "_fragments", "_archive"}
+SKIP_DIRS = {"~merged", "_junk", "_fragments", "_archive",
+              "accomplish", "accomplish_merged", "merged"}
 
 
 # =========================================================================
@@ -239,11 +240,14 @@ JUNK_MAX_S2P = 5
 
 
 def is_junk(run: RunInfo) -> bool:
-    """A run is junk if it has very few s2p files AND no metadata.
+    """A run is junk if it has very few s2p files AND no metadata,
+    OR if it has zero s2p files (empty shell, always junk).
 
     These are typically failed starts, empty shells, or aborted runs
     that produced no meaningful data.
     """
+    if run.s2p_count == 0:
+        return True  # empty shell — always junk, regardless of metadata
     has_metadata = run.has_manifest or run.has_status
     return run.s2p_count <= JUNK_MAX_S2P and not has_metadata
 

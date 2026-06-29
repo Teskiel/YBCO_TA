@@ -488,7 +488,7 @@ def _cmd_auto(base_dir: str, action: str = "check",
     completed_unchecked = _discover_completed_unchecked(base_dir)
 
     if not exp_dirs and not completed_unchecked:
-        print("-- 当前没有活跃的实验 --")
+        # 静默退出：无活跃实验时不输出任何内容，避免干扰正常开发
         return
 
     # 活跃实验 → 状态 + 干预

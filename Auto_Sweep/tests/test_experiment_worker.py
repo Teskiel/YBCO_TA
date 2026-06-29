@@ -1459,9 +1459,9 @@ class TestRecoverableErrorDetection:
                         "The connection for the given session has been lost.")
         assert self._is_recoverable(exc) is True
 
-    def test_given_timeout_when_checking_then_recoverable(self):
-        """含 timeout 关键字 → 可恢复。"""
-        assert self._is_recoverable(Exception("VISA timeout on read")) is True
+    def test_given_timeout_when_checking_then_not_recoverable(self):
+        """含 timeout 关键字 → 不可恢复（由稳定性循环连续失败计数器处理）。"""
+        assert self._is_recoverable(Exception("VISA timeout on read")) is False
 
     def test_given_disconnected_when_checking_then_recoverable(self):
         """含 disconnected → 可恢复。"""

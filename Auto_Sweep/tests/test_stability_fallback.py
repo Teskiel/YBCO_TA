@@ -15,6 +15,7 @@ BDD 测试 — 2 阶段实验稳定性控制器 (ExperimentStabilityController)
 import math
 import sys
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -51,15 +52,15 @@ class TestFixedPIDZones:
         assert pid == {"p": 100, "i": 5, "d": 0}
         assert controller.base_overshoot == 0.0
 
-    def test_given_target_30K_when_setup_then_pid_is_100_0_0_overshoot_1_5(
+    def test_given_target_30K_when_setup_then_pid_is_100_0_0_overshoot_2_5(
         self, controller
     ):
-        """20-40K: P=100, I=0, D=0, overshoot=1.5K。"""
+        """20-40K: P=100, I=0, D=0, overshoot=2.0K。"""
         controller.setup(target_k=30.0, current_temperature=25.0)
         pid = controller.get_fixed_pid()
         assert pid == {"p": 100, "i": 0, "d": 0}
-        assert controller.base_overshoot == 1.5
-        assert controller.current_overshoot == 1.5
+        assert controller.base_overshoot == 2.0
+        assert controller.current_overshoot == 2.0
 
     def test_given_target_40K_when_setup_then_pid_is_100_0_0(self, controller):
         """正好 40K 属于中温区。"""
@@ -67,14 +68,23 @@ class TestFixedPIDZones:
         pid = controller.get_fixed_pid()
         assert pid == {"p": 100, "i": 0, "d": 0}
 
-    def test_given_target_77K_when_setup_then_pid_is_150_0_0_overshoot_2_0(
+    def test_given_target_77K_when_setup_then_pid_is_150_0_0_overshoot_2_5(
         self, controller
     ):
-        """>40K: P=150, I=0, D=0, overshoot=2.0K。"""
+        """>70K (very_high): P=150, I=0, D=0, overshoot=2.5K。"""
         controller.setup(target_k=77.0, current_temperature=70.0)
         pid = controller.get_fixed_pid()
         assert pid == {"p": 150, "i": 0, "d": 0}
-        assert controller.base_overshoot == 2.0
+        assert controller.base_overshoot == 2.5
+
+    def test_given_target_70K_when_setup_then_very_high_zone_overshoot_2_5(
+        self, controller
+    ):
+        """70K 及以上 → very_high 区, overshoot=2.5K。"""
+        controller.setup(target_k=70.0, current_temperature=68.0)
+        pid = controller.get_fixed_pid()
+        assert pid == {"p": 150, "i": 0, "d": 0}
+        assert controller.base_overshoot == 2.5
 
 
 # =========================================================================
@@ -97,36 +107,32 @@ class TestPhaseTransition:
         controller.setup(target_k=30.0, current_temperature=28.0)
         assert controller.phase == StabilityPhase.SPARSE
 
-    def test_given_sparse_when_not_trending_stable_then_stays_sparse(self, controller):
-        """Phase 1 中若未趋于平稳 → 保持 SPARSE。"""
+    def test_given_sparse_when_outside_band_then_stays_sparse(self, controller):
+        """Phase 1 中最近读数超出 ±1K 范围 → 保持 SPARSE。"""
         from ui.experiment_stability_controller import StabilityPhase
 
         controller.setup(target_k=30.0, current_temperature=25.0)
-        # 不稳定数据 — 快速升温中
+        # 快速升温中，最近 4 个读数距目标 >1.0K
         controller._set_monitor_readings_for_test([
-            (26.0, 130), (26.5, 120), (27.0, 110), (27.5, 100),
-            (28.0, 90), (28.5, 80), (29.0, 70),
-            (29.2, 60), (29.4, 50), (29.6, 40),
+            (25.0, 110), (25.5, 80), (26.0, 50), (26.5, 20),
         ])
 
-        result = controller.check(elapsed_s=30.0)
+        # elapsed >= 60s，但温度距目标 >1K
+        result = controller.check(elapsed_s=90.0)
         assert controller.phase == StabilityPhase.SPARSE
 
-    def test_given_sparse_when_trending_stable_then_transitions_to_fine(self, controller):
-        """趋于平稳 → Phase 1→2。"""
+    def test_given_sparse_when_in_band_then_transitions_to_fine(self, controller):
+        """Phase 1→2 简化判据：最近 4 个读数在 ±1K 内 + 满足最小时间 → FINE。"""
         from ui.experiment_stability_controller import StabilityPhase
 
         controller.setup(target_k=30.0, current_temperature=29.5)
-        # 稳定数据 — 温度几乎不变，覆盖 180s 以生成 3 个 1-min 窗口
+        # 最近 4 个读数都在 ±1K 范围内
         controller._set_monitor_readings_for_test([
-            (29.48, 170), (29.50, 160), (29.50, 150), (29.52, 140),
-            (29.50, 130), (29.48, 120), (29.50, 110), (29.49, 100),
-            (29.51, 90),  (29.50, 80),  (29.49, 70),  (29.50, 60),
-            (29.49, 50),  (29.51, 40),  (29.50, 30),  (29.50, 20),
-            (29.49, 10),
+            (29.48, 110), (29.50, 80), (29.49, 50), (29.51, 20),
         ])
 
-        result = controller.check(elapsed_s=30.0)
+        # elapsed_s >= SPARSE_MIN_TIME_S (60s)
+        result = controller.check(elapsed_s=120.0)
         assert controller.phase == StabilityPhase.FINE
 
 
@@ -218,8 +224,8 @@ class TestSetpointOvershootAdjustment:
         controller.setup(target_k=30.0, current_temperature=25.0)
         sp = controller.needs_setpoint_adjustment()
         assert sp is not None
-        # base_overshoot = 1.5K, target = 30.0K → setpoint = 31.5K
-        assert sp == 31.5
+        # base_overshoot = 2.0K, target = 30.0K → setpoint = 32.0K
+        assert sp == 32.0
 
     def test_given_low_temp_when_needs_adjustment_then_setpoint_equals_target(
         self, controller
@@ -284,14 +290,102 @@ class TestSetpointOvershootAdjustment:
         sp2 = controller.needs_setpoint_adjustment()
         assert sp2 is None  # 冷却中
 
-    def test_given_max_adjustments_reached_when_calling_then_returns_none(
+    def test_given_within_0_7K_below_target_when_needs_adjustment_then_adjusts(
         self, controller
     ):
-        """达到最大调整次数 → 不再返回新设定点。"""
+        """温度低于目标但 |Δ| ≤ 0.7K → v1.3 仍上调 overshoot（避免死区）。
+
+        旧行为：in-band 无条件跳过 → P-only 稳态误差落在 0.5K（测量熔断）
+        与 0.7K（band）之间，死锁。
+        新行为：avg < target 时，即使已在 band 内也允许上调 overshoot。
+        """
         controller.setup(target_k=30.0, current_temperature=25.0)
-        controller._setpoint_adjust_count = controller.MAX_OVERSHOOT_ADJUSTMENTS
-        sp = controller.needs_setpoint_adjustment()
-        assert sp is None
+        sp1 = controller.needs_setpoint_adjustment()  # 首次 — 初始设定点
+        assert sp1 is not None
+
+        # 模拟温度接近目标但低于目标（avg ≈ 29.5K，Δ=0.5K ≤ 0.7K）
+        controller._set_monitor_readings_for_test([
+            (29.50, 170), (29.52, 160), (29.48, 150), (29.51, 140),
+            (29.50, 130), (29.49, 120), (29.51, 110), (29.50, 100),
+            (29.49, 90),  (29.51, 80),  (29.50, 70),  (29.48, 60),
+            (29.50, 50),  (29.49, 40),  (29.51, 30),  (29.50, 20),
+            (29.49, 10),
+        ])
+        controller._last_overshoot_time = 0  # 绕过冷却
+
+        sp2 = controller.needs_setpoint_adjustment()
+        # avg=29.5 < target=30.0 → 即使 |Δ|=0.5 ≤ 0.7，也应上调（死区修复）
+        assert sp2 is not None
+        assert sp2 > 30.0  # setpoint 推高以缩小稳态误差
+        assert controller.current_overshoot > controller._base_overshoot
+
+    def test_given_far_from_target_when_multiple_adjustments_then_no_count_limit(
+        self, controller
+    ):
+        """无计数上限 — 即使多次调整，只要温度仍在 0.7K 外且趋势稳就继续。"""
+        controller.setup(target_k=30.0, current_temperature=25.0)
+        sp1 = controller.needs_setpoint_adjustment()  # 首次
+        assert sp1 is not None
+        assert controller._setpoint_adjust_count == 0  # 首次不算入计数
+
+        # 模拟温度稳定但远离目标（Δ ≈ 5K > 0.7K → 应继续调整）
+        temps = [(25.50, 170), (25.52, 160), (25.48, 150), (25.51, 140),
+                 (25.50, 130), (25.49, 120), (25.51, 110), (25.50, 100),
+                 (25.49, 90),  (25.51, 80),  (25.50, 70),  (25.48, 60),
+                 (25.50, 50),  (25.49, 40),  (25.51, 30),  (25.50, 20),
+                 (25.49, 10)]
+        controller._set_monitor_readings_for_test(temps)
+        controller._last_overshoot_time = 0  # 绕过冷却
+
+        # 第 1 次调整
+        sp2 = controller.needs_setpoint_adjustment()
+        assert sp2 is not None, "Δ=4.5K > 0.7K，应允许调整"
+        assert controller._setpoint_adjust_count == 1
+
+        # 第 2 次调整（不应被计数上限阻止）
+        controller._last_overshoot_time = 0  # 再次绕过冷却
+        sp3 = controller.needs_setpoint_adjustment()
+        assert sp3 is not None, \
+            "取消计数上限后，第 2 次调整应允许（Δ 仍 > 0.7K）"
+        assert controller._setpoint_adjust_count == 2
+
+    def test_given_sparse_20s_polling_9_readings_when_adjust_needed_then_returns_setpoint(
+        self, controller
+    ):
+        """回归测试：SPARSE 20s 轮询仅 9 个读数在 180s 窗口时，过冲调整应正常触发。
+
+        2026-06-12 bug: min_readings_required=10 > 9 导致 check_stability()
+        永远返回 avg_temp=None，trending_stable=False，过冲调整死锁。
+        此测试用真实 SPARSE 密度（20s 间隔 × 9 个读数）验证调整可以触发。
+        """
+        # 模拟 36K 目标，温度卡在 ~34.8K（真实 bug 场景）
+        controller.setup(target_k=36.0, current_temperature=34.8)
+        # 首次调用 — 初始设定点
+        sp1 = controller.needs_setpoint_adjustment()
+        assert sp1 is not None
+        base_overshoot = controller.current_overshoot
+        assert base_overshoot == 2.0  # Medium zone
+
+        # 注入 9 个读数，20s 间隔，覆盖 170s（模拟 SPARSE 20s 轮询）
+        controller._set_monitor_readings_for_test([
+            (34.81, 170), (34.82, 150), (34.81, 130),
+            (34.83, 110), (34.82, 90),  (34.81, 70),
+            (34.82, 50),  (34.80, 30),  (34.81, 10),
+        ])
+
+        # 绕过冷却时间
+        controller._last_overshoot_time = 0
+        sp2 = controller.needs_setpoint_adjustment()
+        assert sp2 is not None, (
+            f"SPARSE 20s 密度下（9 读数/180s），过冲调整应触发，"
+            f"但返回了 None。"
+            f"current_overshoot={controller.current_overshoot:.2f}K"
+        )
+        # 过冲应增大：delta=36.0-34.81≈1.19K, new=2.0+1.19=3.19K
+        assert controller.current_overshoot > base_overshoot, (
+            f"过冲应增大: base={base_overshoot:.1f}K, "
+            f"current={controller.current_overshoot:.2f}K"
+        )
 
 
 # =========================================================================
@@ -370,11 +464,21 @@ class TestTimeout:
     def test_given_max_wait_exceeded_when_checking_then_returns_timeout(
         self, controller
     ):
-        """超过 MAX_WAIT_SECONDS → timeout。"""
-        controller.setup(target_k=30.0, current_temperature=25.0)
-        for i in range(20):
-            controller.add_reading(25.5 + 0.05 * (i % 5))
+        """超过 MAX_WAIT_SECONDS → timeout（FINE 阶段）。
 
+        测试前提：控制器必须在 FINE 阶段，MAX_WAIT_SECONDS 才适用。
+        SPARSE 阶段使用独立的 SPARSE_MAX_WAIT_SECONDS (90 min)。
+        """
+        controller.setup(target_k=30.0, current_temperature=30.0)
+        # 添加在目标 ±1K 内的读数，触发 SPARSE→FINE 转换
+        for i in range(20):
+            controller.add_reading(30.0 + 0.05 * (i % 5))
+        # 触发 SPARSE→FINE（需要 elapsed ≥ 60s 且 4 个读数在 band 内）
+        controller.check(elapsed_s=90.0)
+        assert controller.phase.value == "fine", \
+            f"Expected FINE phase, got {controller.phase.value}"
+
+        # FINE 阶段：elapsed 超过 MAX_WAIT_SECONDS → timeout
         result = controller.check(elapsed_s=controller.MAX_WAIT_SECONDS + 1.0)
         assert result.reason == "timeout"
         assert result.total_elapsed_s >= controller.MAX_WAIT_SECONDS
@@ -417,10 +521,17 @@ class TestStabilityResultFields:
     def test_given_timeout_when_checking_then_contains_setpoint_adjustments(
         self, controller
     ):
-        """超时结果应包含调整次数。"""
-        controller.setup(target_k=30.0, current_temperature=25.0)
+        """超时结果应包含调整次数（FINE 阶段）。
+
+        测试前提：先在目标温度附近建立 FINE 状态，再超时。
+        """
+        controller.setup(target_k=30.0, current_temperature=30.0)
         for i in range(50):
-            controller.add_reading(25.5 + 0.05 * (i % 5))
+            controller.add_reading(30.0 + 0.05 * (i % 5))
+        # 触发 SPARSE→FINE
+        controller.check(elapsed_s=90.0)
+        assert controller.phase.value == "fine"
+        # FINE 阶段超时
         result = controller.check(elapsed_s=controller.MAX_WAIT_SECONDS + 1.0)
         assert result.reason == "timeout"
         assert hasattr(result, "setpoint_adjustments")
@@ -558,7 +669,7 @@ class Test18To40KZoneLogic:
         pid = controller.get_fixed_pid()
         assert pid["p"] == 100
         assert pid["i"] == 0
-        assert controller.base_overshoot == 1.5
+        assert controller.base_overshoot == 2.0
 
     def test_given_target_outside_18_to_40K_when_setup_then_standard(self, controller):
         """非 18-40K 温区 → 标准行为。"""
@@ -579,3 +690,437 @@ class Test18To40KZoneLogic:
         controller.setup(target_k=40.0, current_temperature=38.0)
         pid = controller.get_fixed_pid()
         assert pid == {"p": 100, "i": 0, "d": 0}
+
+
+# =========================================================================
+# TestClass: SPARSE → FINE 转换时清空旧读数
+# =========================================================================
+
+class TestSparseToFineClear:
+    """验证 SPARSE → FINE 阶段转换时清空监视器旧读数和重置计时。"""
+
+    @pytest.fixture
+    def controller(self):
+        from ui.experiment_stability_controller import (
+            ExperimentStabilityController, StabilityPhase,
+        )
+        ctrl = ExperimentStabilityController()
+        ctrl.SPARSE_MIN_TIME_S = 0        # 跳过最小等待
+        ctrl.SPARSE_MIN_READINGS = 2       # 仅需 2 个读数
+        ctrl.SPARSE_BAND_K = 1.0
+        # 设置目标温度并注入足够读数以触发 sparse_ready
+        ctrl._target_k = 30.0
+        ctrl._start_time = 100.0
+        return ctrl
+
+    def test_given_sparse_with_readings_when_transition_to_fine_then_monitor_cleared(
+        self, controller):
+        """SPARSE→FINE 时 _monitor.readings 被清空。"""
+        # 添加 2 个在 band 内的读数，触发 sparse_ready
+        controller.add_reading(30.3)
+        controller.add_reading(29.8)
+        assert len(controller._monitor.readings) == 2
+
+        # 调用 check 触发阶段转换
+        result = controller.check(elapsed_s=10.0)
+        assert controller.phase.value == "fine"
+        # 旧读数已被清空
+        assert len(controller._monitor.readings) == 0
+
+    def test_given_sparse_when_transition_to_fine_then_last_stable_time_none(
+        self, controller):
+        """SPARSE→FINE 时 _last_stable_time 被重置为 None。"""
+        controller.add_reading(30.2)
+        controller.add_reading(29.9)
+        controller._last_stable_time = 123.45  # 模拟已有稳态时间
+        controller.check(elapsed_s=10.0)
+        assert controller.phase.value == "fine"
+        assert controller._last_stable_time is None
+
+    def test_given_fine_check_stability_then_only_fine_readings_in_window(
+        self, controller):
+        """FINE 阶段 check_stability 仅基于 FINE 之后的读数。"""
+        # SPARSE 阶段: 在 band 内的读数，触发 sparse→fine
+        controller.add_reading(29.5)  # Δ=-0.5K, 在 ±1K band 内
+        controller.add_reading(29.6)  # Δ=-0.4K, 在 band 内
+        controller.check(elapsed_s=10.0)
+        assert controller.phase.value == "fine"
+        # 清空后添加 FINE 阶段的高质量读数
+        for _ in range(15):
+            controller.add_reading(30.01)  # 非常接近目标
+        stability = controller._monitor.check_stability(30.0)
+        # 应该判定为进入目标区间（因为 FINE 读数全在 ±0.5K 内）
+        assert stability.get("in_target_zone", False), \
+            "FINE 阶段 check_stability 应仅基于清除后的高密度读数"
+
+
+# =========================================================================
+# TestClass: SPARSE 独立超时 + timeout 使用实际温度
+# =========================================================================
+
+class TestSparseTimeout:
+    """验证 SPARSE 阶段 90 min 独立超时。"""
+
+    @pytest.fixture
+    def controller(self):
+        from ui.experiment_stability_controller import (
+            ExperimentStabilityController,
+        )
+        ctrl = ExperimentStabilityController()
+        ctrl.setup(target_k=40.0, current_temperature=25.0)
+        # 缩小超时以便测试
+        ctrl.SPARSE_MAX_WAIT_SECONDS = 100
+        ctrl.SPARSE_MIN_TIME_S = 9999    # 禁用 sparse_ready
+        return ctrl
+
+    def test_given_sparse_when_90_min_elapsed_then_returns_timeout_with_actual_temp(
+        self, controller):
+        """SPARSE 超时返回 timeout + 最后实际温度。"""
+        controller.add_reading(31.5)
+        controller.add_reading(31.6)
+        controller.add_reading(31.7)
+        result = controller.check(elapsed_s=101.0)
+        assert result.reason == "timeout"
+        assert result.phase.value == "sparse"
+        # 使用最后实际读数 31.7K，而非 target 40K
+        assert abs(result.avg_temp - 31.7) < 0.01
+
+    def test_given_sparse_timeout_with_no_readings_then_avg_temp_is_target(
+        self, controller):
+        """SPARSE 超时但无读数时 → avg_temp = target_k。"""
+        result = controller.check(elapsed_s=101.0)
+        assert result.reason == "timeout"
+        assert result.avg_temp == 40.0
+
+    def test_given_fine_phase_when_30_min_elapsed_then_timeout_with_actual(
+        self, controller):
+        """FINE 阶段超时也使用实际温度。"""
+        from ui.experiment_stability_controller import StabilityPhase
+        controller._set_phase_for_test(StabilityPhase.FINE)
+        controller.MAX_WAIT_SECONDS = 10
+        controller.add_reading(38.1)
+        controller.add_reading(38.2)
+        controller.add_reading(38.3)
+        result = controller.check(elapsed_s=11.0)
+        assert result.reason == "timeout"
+        assert abs(result.avg_temp - 38.3) < 0.01
+
+    def test_given_fine_timeout_with_readings_then_avg_temp_is_last_actual(
+        self, controller):
+        """timeout 有读数时 avg_temp = 最后实际温度而非 target_k。"""
+        from ui.experiment_stability_controller import StabilityPhase
+        controller._set_phase_for_test(StabilityPhase.FINE)
+        controller.MAX_WAIT_SECONDS = 5
+        controller.add_reading(37.5)
+        result = controller.check(elapsed_s=6.0)
+        assert result.reason == "timeout"
+        assert abs(result.avg_temp - 37.5) < 0.01
+        # 确保不是 target 默认值
+        assert abs(result.avg_temp - 40.0) > 0.5
+
+
+# =========================================================================
+# TestClass: 双向 overshoot 调整 (v1.2)
+# =========================================================================
+
+class TestBidirectionalOvershoot:
+    """验证 overshoot 可增可减，钳位 [0, MAX_OVERSHOOT_K]。"""
+
+    @pytest.fixture
+    def controller(self):
+        from ui.experiment_stability_controller import (
+            ExperimentStabilityController,
+        )
+        return ExperimentStabilityController()
+
+    def _make_stable(self, ctrl, temps, target=30.0, start_offset=0):
+        """用合成温度数据填充监视器，使 trending_stable=True 且 |avg−target| > 0.7K。
+
+        使用 15s 间隔确保 3 分钟窗口内 ≥12 个读数（满足 min_readings=6 要求）。
+        """
+        now = time.time()
+        from stability_monitor import TemperatureReading
+        ctrl._target_k = target
+        ctrl._start_time = time.monotonic()
+        ctrl._current_overshoot = ctrl._base_overshoot
+        readings = []
+        for i, t in enumerate(temps):
+            readings.append(TemperatureReading(
+                timestamp=now - (len(temps) - i) * 15,  # 15s 间隔
+                temperature=t,
+                target=target,
+            ))
+        ctrl._monitor.readings = readings
+
+    def test_given_temp_below_target_when_adjust_then_overshoot_increases(
+            self, controller):
+        """温度低于目标 → delta>0 → overshoot 增大。"""
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        # 初始 setpoint 写入
+        sp = controller.needs_setpoint_adjustment()
+        assert sp is not None  # 首次调用返回初始 setpoint
+
+        # 模拟温度稳定在 67.0K 附近
+        self._make_stable(controller,
+                          [67.1, 67.0, 66.9, 67.0, 67.1, 67.0,
+                           67.0, 66.9, 67.0, 67.1, 67.0, 66.9],
+                          target=68.0)
+        # 重置 initial_setpoint_written 以触发调整
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+
+        sp = controller.needs_setpoint_adjustment()
+        assert sp is not None
+        # overshoot 应从 base=2.0 增大（delta=+1.0 → overshoot≈3.0）
+        assert controller.current_overshoot > 2.0
+        assert sp > 68.0
+
+    def test_given_temp_above_target_when_adjust_then_overshoot_decreases(
+            self, controller):
+        """温度越过目标 → delta<0 → overshoot 减小。"""
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        controller.needs_setpoint_adjustment()  # 首次
+
+        # 模拟温度越过目标到 69.5K
+        self._make_stable(controller,
+                          [69.5, 69.6, 69.4, 69.5, 69.6, 69.4,
+                           69.5, 69.5, 69.4, 69.5, 69.6, 69.4],
+                          target=68.0)
+        # 手动推向高位（模拟之前调整的结果）
+        controller._current_overshoot = 2.5
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+
+        sp = controller.needs_setpoint_adjustment()
+        # delta = 68.0 − 69.5 = −1.5 → overshoot = 2.5 + (−1.5) = 1.0
+        assert controller.current_overshoot < 2.5
+        assert controller.current_overshoot >= 0.0
+        if sp is not None:
+            assert sp <= 69.5  # setpoint 缩回了
+
+    def test_given_temp_well_above_target_when_adjust_then_overshoot_clamped_at_zero(
+            self, controller):
+        """温度远超目标 → overshoot 钳位到 0（setpoint = target）。"""
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        controller.needs_setpoint_adjustment()
+
+        self._make_stable(controller,
+                          [70.0, 69.9, 70.1, 70.0, 69.9, 70.1,
+                           70.0, 70.0, 69.9, 70.0, 70.1, 70.0],
+                          target=68.0)
+        controller._current_overshoot = 2.0
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+
+        sp = controller.needs_setpoint_adjustment()
+        # delta = 68.0 − 70.0 = −2.0 → overshoot = 2.0 + (−2.0) = 0
+        assert controller.current_overshoot == 0.0
+        if sp is not None:
+            assert sp == 68.0  # setpoint = target，不关加热器
+
+    def test_given_temp_near_target_when_overshoot_zero_then_setpoint_equals_target(
+            self, controller):
+        """overshoot=0 时 setpoint 即 target，不会低于 target。"""
+        controller.setup(target_k=68.0, current_temperature=67.0)
+        controller._current_overshoot = 0.0
+        sp = controller._calculate_setpoint_from_overshoot()
+        assert sp == 68.0
+
+    def test_given_trending_not_stable_when_temp_above_then_no_adjustment(
+            self, controller):
+        """trending_stable=False 时不触发任何调整（无论 delta 符号）。"""
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        controller.needs_setpoint_adjustment()  # 首次
+
+        # 不稳定状态 — trending_stable 会返回 False
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+        controller.add_reading(69.8)
+        controller.add_reading(69.9)
+
+        sp = controller.needs_setpoint_adjustment()
+        # 数据不足 → trending_stable=False → 不调整
+        assert sp is None
+
+
+# =========================================================================
+# TestClass: Overshoot 学习器 (v1.2)
+# =========================================================================
+
+class TestOvershootLearning:
+    """验证 overshoot 记录、加载、持久化的完整流程。"""
+
+    @pytest.fixture
+    def controller(self):
+        from ui.experiment_stability_controller import (
+            ExperimentStabilityController,
+        )
+        return ExperimentStabilityController()
+
+    def test_given_no_learning_when_setup_then_uses_zone_default(
+            self, controller):
+        """无学习数据 → 使用温区默认 base_overshoot。"""
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        assert controller.current_overshoot == 2.0  # high zone default
+
+    def test_given_learned_overshoot_when_setup_then_uses_learned_value(
+            self, controller):
+        """有学习数据 → 跳过 zone 默认值，使用已记录的 overshoot。"""
+        controller.set_overshoot_learning({68.0: 0.5, 40.0: 1.5})
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        assert controller.current_overshoot == 0.5
+
+    def test_given_learned_for_other_temp_when_setup_then_uses_zone_default(
+            self, controller):
+        """学习数据中没有当前温度 → 回退到 zone 默认值。"""
+        controller.set_overshoot_learning({40.0: 1.5})
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        assert controller.current_overshoot == 2.0  # high zone default
+
+    def test_given_record_result_when_get_learning_then_returns_recorded_value(
+            self, controller):
+        """record_result() 后 get_overshoot_learning() 应包含该温度点。"""
+        controller.setup(target_k=68.0, current_temperature=66.0)
+        controller._current_overshoot = 0.5  # 模拟稳定后的值
+        controller.record_result()
+
+        learning = controller.get_overshoot_learning()
+        assert 68.0 in learning
+        assert learning[68.0] == 0.5
+
+    def test_given_multiple_record_results_when_get_learning_then_all_present(
+            self, controller):
+        """多次 record_result() 累积所有温度点。"""
+        for t, ov in [(6.0, 0.0), (20.0, 2.0), (68.0, 0.5)]:
+            controller.setup(target_k=t, current_temperature=t - 1.0)
+            controller._current_overshoot = ov
+            controller.record_result()
+
+        learning = controller.get_overshoot_learning()
+        assert learning == {6.0: 0.0, 20.0: 2.0, 68.0: 0.5}
+
+    def test_given_set_learning_then_get_returns_same(self, controller):
+        """set→get 往返一致。"""
+        data = {10.0: 0.0, 30.0: 1.0, 50.0: 1.5, 77.0: 2.0}
+        controller.set_overshoot_learning(data)
+        assert controller.get_overshoot_learning() == data
+
+    def test_given_empty_learning_when_setup_then_no_effect(self, controller):
+        """空 dict 不应影响正常 setup。"""
+        controller.set_overshoot_learning({})
+        controller.setup(target_k=30.0, current_temperature=28.0)
+        assert controller.current_overshoot == 2.0  # medium zone default
+
+
+# =========================================================================
+# TestClass: 区间内死区修复 (v1.3)
+# =========================================================================
+
+class TestInBandDeadZone:
+    """验证 in-band 时 overshoot 跳过条件：仅当 avg ≥ target 且 |Δ| ≤ 0.7K
+    时才跳过。avg < target 时即使已在 band 内，也允许上调 overshoot。"""
+
+    @pytest.fixture
+    def controller(self):
+        from ui.experiment_stability_controller import (
+            ExperimentStabilityController,
+        )
+        return ExperimentStabilityController()
+
+    def _make_stable(self, ctrl, temps, target=72.0, start_offset=0):
+        """填充监视器读数使 trending_stable=True。
+
+        使用 15s 间隔确保 3 分钟窗口内 ≥12 个读数（满足 min_readings=6）。
+        """
+        now = time.time()
+        from stability_monitor import TemperatureReading
+        ctrl._target_k = target
+        ctrl._start_time = time.monotonic()
+        ctrl._current_overshoot = ctrl._base_overshoot
+        readings = []
+        for i, t in enumerate(temps):
+            readings.append(TemperatureReading(
+                timestamp=now - (len(temps) - i) * 15,
+                temperature=t,
+                target=target,
+            ))
+        ctrl._monitor.readings = readings
+
+    def test_given_in_band_below_target_when_adjust_then_overshoot_increases(
+            self, controller):
+        """72K 死锁场景: avg=71.49, |Δ|=0.51 ≤ 0.7K 但 avg < target
+        → 不应跳过，应上调 overshoot 缩小稳态误差。"""
+        controller.setup(target_k=72.0, current_temperature=70.0)
+        controller.needs_setpoint_adjustment()  # 首次调用
+
+        # 模拟温度卡在 71.49K（72K 场景的死锁点）
+        self._make_stable(controller,
+                          [71.49, 71.50, 71.48, 71.49, 71.50, 71.48,
+                           71.49, 71.49, 71.50, 71.48, 71.49, 71.50],
+                          target=72.0)
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+
+        sp = controller.needs_setpoint_adjustment()
+        # 必须返回有效调整（非 None）——死区修复的核心
+        assert sp is not None
+        # overshoot 应从 base 增大：72K ∈ very_high 区 (base=2.5),
+        # delta=72.0−71.49=0.51, current_overshoot=2.5+0.51=3.01
+        assert controller.current_overshoot > 2.0
+        assert controller.current_overshoot <= 3.5  # 合理范围内（含 FP 容差）
+
+    def test_given_in_band_above_target_when_adjust_then_skip(
+            self, controller):
+        """avg ≥ target 且在 band 内 → 正常跳过（无需推得更高）。"""
+        controller.setup(target_k=72.0, current_temperature=70.0)
+        controller.needs_setpoint_adjustment()
+
+        # 温度略高于目标，已在 band 内
+        self._make_stable(controller,
+                          [72.30, 72.31, 72.29, 72.30, 72.31, 72.29,
+                           72.30, 72.30, 72.31, 72.29, 72.30, 72.30],
+                          target=72.0)
+        controller._current_overshoot = 2.0
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+
+        sp = controller.needs_setpoint_adjustment()
+        # avg=72.3 ≥ target, |Δ|=0.3 ≤ 0.7 → 跳过
+        assert sp is None
+
+    def test_given_in_band_exactly_at_target_when_adjust_then_skip(
+            self, controller):
+        """avg == target 且 |Δ|=0 → 跳过调整。"""
+        controller.setup(target_k=72.0, current_temperature=70.0)
+        controller.needs_setpoint_adjustment()
+
+        self._make_stable(controller,
+                          [72.0, 72.0, 72.0, 72.0, 72.0, 72.0,
+                           72.0, 72.0, 72.0, 72.0, 72.0, 72.0],
+                          target=72.0)
+        controller._current_overshoot = 2.0
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+
+        sp = controller.needs_setpoint_adjustment()
+        assert sp is None
+
+    def test_given_above_band_when_adjust_then_overshoot_decreases(
+            self, controller):
+        """ |Δ| > 0.7K 且 avg > target → 正常执行双向缩小。"""
+        controller.setup(target_k=72.0, current_temperature=70.0)
+        controller.needs_setpoint_adjustment()
+
+        # 温度越过目标且超出 band
+        self._make_stable(controller,
+                          [73.0, 73.1, 72.9, 73.0, 73.1, 72.9,
+                           73.0, 73.0, 73.1, 72.9, 73.0, 73.0],
+                          target=72.0)
+        controller._current_overshoot = 2.0
+        controller._initial_setpoint_written = True
+        controller._last_overshoot_time = time.monotonic() - 130
+
+        sp = controller.needs_setpoint_adjustment()
+        # delta=72−73=−1 → overshoot=2+(−1)=1.0
+        assert controller.current_overshoot < 2.0
+        assert controller.current_overshoot >= 0.0

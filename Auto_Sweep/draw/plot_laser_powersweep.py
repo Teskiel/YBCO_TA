@@ -5,7 +5,7 @@ import os
 import glob
 import skrf as rf
 
-target_dir = r'D:/YBCO/VNAMeas/Auto_Sweep/experiment_data/20260605_215526/8K/actual_7.718K/-25dBm'
+target_dir = r'D:\YBCO\VNAMeas\Auto_Sweep\experiment_data\20260609_185708\20K\-43dBm'
 
 # 1. 严格获取文件列表
 s2p_files = sorted(glob.glob(os.path.join(target_dir, '**', '*.s2p'), recursive=True))

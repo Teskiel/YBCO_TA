@@ -35,6 +35,8 @@ from config import (
     power_levels_mw, temperature_levels_k,
     temperature_poll_seconds, max_wait_seconds, stable_hold_seconds,
     custom_stability_settings, setpoint_adjust_settings,
+    memory_monitor_enabled, memory_warning_threshold_mb,
+    memory_critical_threshold_mb, memory_check_interval_s,
 )
 
 # ---- algorithms ----
@@ -51,6 +53,9 @@ from lakeshore_control import (
 )
 from vna_control import save_s2p, try_connect
 from laser_driver import LaserController
+
+# ---- memory monitoring ----
+from memory_monitor import MemoryMonitor
 
 
 # =========================================================================
@@ -75,7 +80,7 @@ def set_laser_power(laser, power_mw: float, time_elapse: float = 20):
 # =========================================================================
 
 def wait_for_temperature(temp_reader, target_k: float,
-                         stability_monitor=None):
+                         stability_monitor=None, memory_monitor=None):
     """Wait for cryostat temperature to stabilise at ``target_k``.
 
     Coordinates LakeShore, stability monitor, PID controller, and
@@ -87,12 +92,16 @@ def wait_for_temperature(temp_reader, target_k: float,
         adjust once rate-of-change is stable
       - Final measurement only after ``stable_hold_seconds``
         continuously within ``final_stable_band_k``
+
+    If ``memory_monitor`` is provided, memory usage is checked
+    periodically and logged.
     """
     if stability_monitor is None:
         stability_monitor = AdvancedStabilityMonitor()
 
     start_time = time()
     last_stable_time = None
+    last_memory_check = 0.0  # 上次内存检查的时间戳
     setpoint_adjusted = False
     current_setpoint = target_k
 
@@ -186,6 +195,16 @@ def wait_for_temperature(temp_reader, target_k: float,
                   f"Continuing.")
             return current_k
 
+        # ---- periodic memory check ----
+        if memory_monitor and memory_monitor_enabled:
+            now = time()
+            if now - last_memory_check >= memory_check_interval_s:
+                info = memory_monitor.check()
+                print(memory_monitor.format_info(info))
+                if info.warning:
+                    print(memory_monitor.format_warning(info))
+                last_memory_check = now
+
         sleep(temperature_poll_seconds)
 
 
@@ -225,7 +244,7 @@ def main():
     laser = None
     try:
         laser = LaserController(laser_resource)
-        if not laser.connect():
+        if not laser.connect_with_retry(max_attempts=5, base_delay_s=3.0):
             laser = None
             print("[Warning] Laser connection failed, continuing without laser")
     except Exception as e:
@@ -251,12 +270,25 @@ def main():
     count = 0
     stability_monitor = AdvancedStabilityMonitor()
 
+    # ---- memory monitor ----
+    mem_monitor = None
+    if memory_monitor_enabled:
+        mem_monitor = MemoryMonitor(
+            warning_threshold_mb=memory_warning_threshold_mb,
+            critical_threshold_mb=memory_critical_threshold_mb,
+        )
+        info = mem_monitor.check()
+        print(mem_monitor.format_info(info))
+        print(f"Memory monitoring enabled. "
+              f"Warning: <{memory_warning_threshold_mb}MB, "
+              f"Critical: <{memory_critical_threshold_mb}MB")
+
     try:
         for target_temp_k in temperature_levels_k:
             print(f"\n>>> Preparing measurement at {target_temp_k} K")
 
             current_temp_k = wait_for_temperature(
-                temp_reader, target_temp_k, stability_monitor)
+                temp_reader, target_temp_k, stability_monitor, mem_monitor)
 
             target_temp_str = f"{target_temp_k:g}K"
 
@@ -317,6 +349,11 @@ def main():
         except Exception as e:
             print(f"Resource close warning (VNA): {e}")
         print(f"Temperature sweep completed. {count} measurements taken.")
+
+        # ---- memory summary ----
+        if mem_monitor:
+            print()
+            print(mem_monitor.summary())
 
 
 if __name__ == "__main__":

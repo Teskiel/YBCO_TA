@@ -34,10 +34,12 @@ class LaserController:
     and provides emergency shutdown with automatic recovery.
     """
 
-    def __init__(self, resource_address: str = "TCPIP0::100.65.11.65::INSTR"):
+    def __init__(self, resource_address: str = "TCPIP0::100.65.11.65::INSTR",
+                 resource_manager: Optional[pyvisa.ResourceManager] = None):
         self.resource_address = resource_address
         self.inst: Optional[pyvisa.Resource] = None
         self.rm: Optional[pyvisa.ResourceManager] = None
+        self._shared_rm = resource_manager  # 共享 ResourceManager（GUI 多线程安全）
         self.connected = False
         self.current_power: Optional[float] = None
         self.target_wavelength = 1500  # nm
@@ -45,9 +47,18 @@ class LaserController:
     # ==================== Connection ====================
 
     def connect(self) -> bool:
-        """Open VISA connection and verify identity."""
+        """Open VISA connection and verify identity (single attempt).
+
+        如果构造时传入了共享 ResourceManager 则复用它（GUI 多线程安全），
+        否则创建独立的 ResourceManager（命令行模式向后兼容）。
+
+        对于间歇性 VI_ERROR_RSRC_NFOUND，请使用 connect_with_retry()。
+        """
         try:
-            self.rm = pyvisa.ResourceManager("visa32.dll")
+            if self._shared_rm is not None:
+                self.rm = self._shared_rm
+            else:
+                self.rm = pyvisa.ResourceManager("visa32.dll")
             self.inst = self.rm.open_resource(self.resource_address)
             self.inst.timeout = 5000
             idn = self.inst.query("*IDN?").strip()
@@ -59,15 +70,153 @@ class LaserController:
             self.connected = False
             return False
 
-    def disconnect(self) -> None:
-        """Close VISA session."""
+    def connect_with_retry(self, max_attempts: int = 5,
+                           base_delay_s: float = 3.0,
+                           log_callback=None) -> bool:
+        """带指数退避的连接尝试 — 解决间歇性 VI_ERROR_RSRC_NFOUND。
+
+        失败模式: PyVISA ResourceManager 创建时扫描一次仪器列表。
+        如果激光器启动慢 / 网络延迟 / DNS 未注册，第一次扫描不到，
+        后续 connect() 会持续失败。
+
+        此方法每次失败后：
+          1. 关闭旧 ResourceManager
+          2. 等待退避延迟
+          3. 强制 list_resources() 触发 NI-VISA 重新扫描网络
+          4. 创建新 ResourceManager 重新尝试
+
+        Parameters
+        ----------
+        max_attempts: 最大尝试次数（默认 5，总共约 90s）
+        base_delay_s: 基础等待秒数（默认 3.0，按 1.5× 递增）
+        log_callback: 可选 callable(msg)，用于 GUI 线程安全日志。
+
+        Returns
+        -------
+        True 如果连接成功，False 如果全部尝试失败。
+        """
+        import time as _time
+
+        def _log(msg):
+            print(msg)
+            if log_callback:
+                try:
+                    log_callback(msg)
+                except Exception:
+                    pass
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # 关闭上一次失败的 RM（如有）
+                if self.rm and self._shared_rm is None:
+                    try:
+                        self.rm.close()
+                    except Exception:
+                        pass
+                    self.rm = None
+
+                # 创建全新的 ResourceManager
+                if self._shared_rm is not None:
+                    self.rm = self._shared_rm
+                else:
+                    self.rm = pyvisa.ResourceManager("visa32.dll")
+
+                # 强制扫描仪器列表（刷新 NI-VISA 缓存）
+                try:
+                    resources = self.rm.list_resources()
+                    matching = [r for r in resources
+                                if self.resource_address in r
+                                or 'N7779' in r]
+                    if matching:
+                        _log(f"[Info] Laser found in VISA scan: {matching[0]}")
+                    else:
+                        _log(f"[Info] Laser not yet visible in VISA scan "
+                             f"({len(resources)} resources found)")
+                except Exception:
+                    pass  # list_resources 失败不是致命的
+
+                # 尝试打开
+                self.inst = self.rm.open_resource(self.resource_address)
+                self.inst.timeout = 5000
+                idn = self.inst.query("*IDN?").strip()
+                _log(f"[OK] Laser connected (attempt {attempt}/{max_attempts}): {idn}")
+                self.connected = True
+                return True
+
+            except Exception as e:
+                err_msg = str(e)
+                if self.inst:
+                    try:
+                        self.inst.close()
+                    except Exception:
+                        pass
+                    self.inst = None
+
+                if attempt < max_attempts:
+                    delay = base_delay_s * (1.5 ** (attempt - 1))
+                    _log(f"[Retry] Laser connect attempt {attempt}/{max_attempts} "
+                         f"failed: {err_msg[:80]}")
+                    _log(f"[Retry] Waiting {delay:.1f}s before next attempt...")
+                    _time.sleep(delay)
+                else:
+                    _log(f"[Error] Laser connection failed after "
+                         f"{max_attempts} attempts: {err_msg}")
+                    self.connected = False
+                    return False
+
+        return False
+
+    def reconnect(self) -> bool:
+        """关闭旧会话 + 重建 ResourceManager + 重新连接。
+
+        比 connect_with_retry() 更激进 — 强制关闭 RM 再创建新的。
+        适用于实验中检测到激光断连后的恢复。
+
+        Returns
+        -------
+        True 如果重连成功。
+        """
+        import time as _time
+        import gc as _gc
+
+        # 1. 彻底关闭
         try:
             if self.inst:
                 self.inst.close()
-            if self.rm:
+                self.inst = None
+        except Exception:
+            pass
+
+        if self._shared_rm is None:
+            try:
+                if self.rm:
+                    self.rm.close()
+            except Exception:
+                pass
+            self.rm = None
+
+        _gc.collect()
+        _time.sleep(2.0)
+
+        # 2. 带重试的重新连接
+        return self.connect_with_retry(max_attempts=3, base_delay_s=2.0)
+
+    def disconnect(self) -> None:
+        """Close VISA session.
+
+        仅关闭 instrument 句柄；共享 ResourceManager 由 MainWindow 统一管理，
+        不在此处关闭（避免影响其他设备）。
+        """
+        try:
+            if self.inst:
+                self.inst.close()
+                self.inst = None
+            # 仅自有 RM 才关闭，共享 RM 由外部管理
+            if self._shared_rm is None and self.rm:
                 self.rm.close()
         except Exception:
             pass
+        self.rm = None
         self.connected = False
 
     def is_connected(self) -> bool:

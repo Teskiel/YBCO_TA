@@ -2,7 +2,7 @@
 """
 BDD tests for pid_parameters.py — PID zone manager and setpoint calculator.
 
-Covers: 3-zone PID lookup, zone boundary correctness, setpoint overshoot
+Covers: 4-zone PID lookup, zone boundary correctness, setpoint overshoot
 with min/max clamp, no-overshoot below 20K, heater range constraints
 (Low + Medium only, High forbidden), full 10K→80K sweep validation.
 """
@@ -50,9 +50,9 @@ class TestPIDZoneManagerBounds:
     def setup(self):
         self.manager = PIDZoneManager()
 
-    def test_given_default_manager_when_initialized_then_has_3_zones(self):
+    def test_given_default_manager_when_initialized_then_has_4_zones(self):
         zones = self.manager.get_all_zones()
-        assert len(zones) == 3
+        assert len(zones) == 4
 
     # ---- Zone 1: Low (≤ 20K) ----
 
@@ -92,7 +92,8 @@ class TestPIDZoneManagerBounds:
         zone = self.manager.get_zone(40.0)
         assert zone.zone_id == 2
 
-    # ---- Zone 3: High (> 40K) ----
+    # ---- Zone 3: High (40–70K) ----
+    # ---- Zone 4: Very High (> 70K) ----
 
     def test_given_40_001K_when_getting_zone_then_returns_zone_3(self):
         zone = self.manager.get_zone(40.001)
@@ -106,9 +107,22 @@ class TestPIDZoneManagerBounds:
         zone = self.manager.get_zone(60.0)
         assert zone.zone_id == 3
 
-    def test_given_80K_when_getting_zone_then_returns_zone_3(self):
-        zone = self.manager.get_zone(80.0)
+    def test_given_exactly_70K_when_getting_zone_then_returns_zone_3(self):
+        """70.0K is the upper bound of zone 3 (≤ 70)."""
+        zone = self.manager.get_zone(70.0)
         assert zone.zone_id == 3
+
+    def test_given_70_001K_when_getting_zone_then_returns_zone_4(self):
+        zone = self.manager.get_zone(70.001)
+        assert zone.zone_id == 4
+        assert zone.p == 150.0
+        assert zone.i == 0.0
+        assert zone.d == 0.0
+        assert zone.heater_range == 2  # Medium (High forbidden)
+
+    def test_given_80K_when_getting_zone_then_returns_zone_4(self):
+        zone = self.manager.get_zone(80.0)
+        assert zone.zone_id == 4
 
 
 # =========================================================================
@@ -126,9 +140,9 @@ class TestPIDZoneManagerClamping:
         zone = self.manager.get_zone(5.0)
         assert zone.zone_id == 1
 
-    def test_given_100K_above_max_when_getting_zone_then_clamps_to_zone_3(self):
+    def test_given_100K_above_max_when_getting_zone_then_clamps_to_zone_4(self):
         zone = self.manager.get_zone(100.0)
-        assert zone.zone_id == 3
+        assert zone.zone_id == 4
 
 
 # =========================================================================
@@ -158,8 +172,9 @@ class TestPIDZoneManagerGetParams:
         assert params["heater_range"] == 2
         assert params["heater_range_name"] == "Medium"
 
-    def test_given_77K_when_getting_params_then_high_zone(self):
+    def test_given_77K_when_getting_params_then_very_high_zone(self):
         params = self.manager.get_params(77.0)
+        assert params["zone_id"] == 4
         assert params["p"] == 150.0
         assert params["i"] == 0.0
         assert params["heater_range"] == 2  # Medium, not High
@@ -206,7 +221,7 @@ class TestFullSweep10Kto80K:
             assert params["i"] >= 0
             assert params["d"] == 0
             assert params["heater_range"] in (1, 2)
-            assert params["zone_id"] in (1, 2, 3)
+            assert params["zone_id"] in (1, 2, 3, 4)
 
     def test_given_every_2k_step_when_checking_zone_transition_then_below_20_is_zone_1(self):
         for t in [10, 12, 14, 16, 18, 20]:
@@ -218,10 +233,15 @@ class TestFullSweep10Kto80K:
             zone = self.manager.get_zone(float(t))
             assert zone.zone_id == 2, f"{t}K should be zone 2, got zone {zone.zone_id}"
 
-    def test_given_every_2k_step_when_checking_zone_transition_then_above_40_is_zone_3(self):
-        for t in [42, 50, 60, 70, 80]:
+    def test_given_every_2k_step_when_checking_zone_transition_then_40_to_70_is_zone_3(self):
+        for t in [42, 50, 60, 70]:
             zone = self.manager.get_zone(float(t))
             assert zone.zone_id == 3, f"{t}K should be zone 3, got zone {zone.zone_id}"
+
+    def test_given_every_2k_step_when_checking_zone_transition_then_above_70_is_zone_4(self):
+        for t in [72, 80, 90, 100]:
+            zone = self.manager.get_zone(float(t))
+            assert zone.zone_id == 4, f"{t}K should be zone 4, got zone {zone.zone_id}"
 
 
 # =========================================================================

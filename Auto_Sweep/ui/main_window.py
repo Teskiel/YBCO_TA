@@ -15,6 +15,8 @@ import os
 import time
 from typing import Optional
 
+import pyvisa
+
 from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QMainWindow, QStackedWidget, QMessageBox
 
@@ -55,10 +57,13 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.lakeshore_page) # 2
         self.stack.addWidget(self.vna_page)       # 3
 
+        # ---- 共享 VISA ResourceManager（避免多线程竞争 VI_ERROR_RSRC_NFOUND） ----
+        self._visa_rm = pyvisa.ResourceManager("visa32.dll")
+
         # ---- workers ----
-        self.laser_worker = LaserWorker()
-        self.lakeshore_worker = LakeShoreWorker()
-        self.vna_worker = VNAWorker()
+        self.laser_worker = LaserWorker(resource_manager=self._visa_rm)
+        self.lakeshore_worker = LakeShoreWorker(resource_manager=self._visa_rm)
+        self.vna_worker = VNAWorker(resource_manager=self._visa_rm)
 
         self.laser_thread = QThread()
         self.lakeshore_thread = QThread()
@@ -471,12 +476,6 @@ class MainWindow(QMainWindow):
             old.stop()
             old.deleteLater()
 
-        # 停止旧定时器（防止泄漏和并发重连）
-        old = self._reconnect_timers.get(device)
-        if old is not None:
-            old.stop()
-            old.deleteLater()
-
         # 延迟重连（给硬件恢复时间）
         import config
         delay_ms = config.reconnect_delay_seconds * 1000
@@ -552,6 +551,26 @@ class MainWindow(QMainWindow):
                 "Please select at least one laser power level "
                 "on the Laser page.")
             return
+
+        # ---- 清理上次实验残留 ----
+        # 1) 终止当前进程中仍在运行的旧 worker / thread
+        if self.experiment_worker or self.experiment_thread:
+            self.dashboard.log(_ts() + "清理上次实验 worker…")
+            if self.experiment_worker:
+                self.experiment_worker.abort()
+            self._cleanup_experiment()
+
+        # 2) 终止泄漏的僵尸 Python 子进程（watchdog 等）
+        try:
+            from zombie_killer import kill_zombie_processes
+            killed, freed_mb = kill_zombie_processes(
+                log_callback=lambda msg: self.dashboard.log(_ts() + msg))
+            if killed:
+                self.dashboard.log(
+                    _ts() +
+                    f"僵尸进程清理: 终止 {killed} 个, 释放 ~{freed_mb:.0f} MB")
+        except Exception:
+            pass  # 非致命，不阻塞实验启动
 
         vna_settings = self.vna_page.get_all_settings()
         output_dir = os.path.join(
@@ -777,5 +796,13 @@ class MainWindow(QMainWindow):
         for thr in (self.laser_thread, self.lakeshore_thread, self.vna_thread):
             thr.quit()
             thr.wait(2000)
+
+        # 关闭共享 VISA ResourceManager
+        if self._visa_rm:
+            try:
+                self._visa_rm.close()
+            except Exception:
+                pass
+            self._visa_rm = None
 
         event.accept()
