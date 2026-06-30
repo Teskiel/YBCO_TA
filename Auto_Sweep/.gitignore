@@ -21,5 +21,12 @@ __pycache__/
 # 图片输出
 plot_dashboard/pic/
 
+# SDD 状态目录
+.superpowers/
+
+# 绘图输出（图片和数据）
+draw/figures/
+draw/output/
+
 # 系统文件
 Thumbs.db

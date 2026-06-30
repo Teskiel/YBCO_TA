@@ -22,6 +22,15 @@ __pycache__/
 *.pyo
 .venv/
 
+# 临时文件
+*.tmp.*
+
+# Playwright MCP 浏览器状态
+.playwright-mcp/
+
+# 会话临时目录
+.temp/
+
 # 系统文件
 Thumbs.db
 .DS_Store

@@ -1245,6 +1245,13 @@ class ExperimentWorker(QObject):
 
             if self._lakeshore_ctrl:
                 try:
+                    # 先尝试修复 VISA session（RS-232 串口断开需重建连接，
+                    # 不能直接用旧 session 重试——旧 session 已死透）
+                    try:
+                        if not self._lakeshore_ctrl.reconnect():
+                            self._lakeshore_ctrl.hard_reconnect()
+                    except AttributeError:
+                        pass  # 非 LakeShore335 对象，跳过修复
                     t = self._lakeshore_ctrl.get_temperature("A")
                     if t is None:
                         raise Exception("temperature read returned None")

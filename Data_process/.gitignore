@@ -1,0 +1,23 @@
+# PPT/图片输出
+_pptx_images/
+output/
+ppt_presentation/
+slidev_presentation/
+nblm_ppt/
+templates/
+
+# 临时文件
+*.tmp.*
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# 压缩包
+*.zip
+*.rar
+*.pptx
+
+# 系统文件
+Thumbs.db
